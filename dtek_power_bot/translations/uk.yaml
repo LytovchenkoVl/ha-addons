@@ -14,3 +14,6 @@ configuration:
   deny_message:
     name: Відповідь для сторонніх
     description: Що бот напише людині без доступу. Свій Telegram ID вона побачить під цим текстом
+  admin_users:
+    name: Адміністратори
+    description: Telegram ID (числом) або @username тих, кому доступна команда /stats. Адміністратори завжди мають доступ до бота
