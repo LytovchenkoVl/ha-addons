@@ -172,14 +172,23 @@ async def get_fact(region: str, max_age: float = 60) -> dict:
 
 
 # ---------- пошук адреси ----------
-_PREFIX = re.compile(r"^(м|с|смт|сел|селище|с-ще|вул|вулиця|пров|провулок|просп|проспект|бульв|бульвар|пл|площа|шосе)\s+")
+_PREFIX = re.compile(r"^(м|с|смт|сел|селище|с ще|вул|вулиця|пров|провулок|просп|проспект|бульв|бульвар|пл|площа|шосе)\s+")
 _LAT2CYR = str.maketrans({"a": "а", "e": "е", "o": "о", "c": "с", "i": "і", "p": "р", "x": "х", "k": "к"})
 
 
 def norm(s: str) -> str:
     s = s.lower().replace("’", "'").replace("ʼ", "'").replace("`", "'").replace("ё", "е")
-    s = re.sub(r"[.,\"«»()]+", " ", s)
-    return re.sub(r"\s+", " ", s).strip()
+    # «№», «/», «-» теж роздільники: «Військове містечко №11» = «військове містечко 11», «в/ч-0565» = «в ч 0565»
+    s = re.sub(r"[.,\"«»()№/\\_-]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    # скорочення, якими ДТЕК і люди пишуть військові об'єкти: «В/Ч 2860», «В/М 11», «вч 0565»
+    s = re.sub(r"(?<!\w)(в ч|вч)(?!\w)", "військова частина", s)
+    s = re.sub(r"(?<!\w)(в м|вм)(?!\w)", "військове містечко", s)
+    return s
+
+
+def compact(s: str) -> str:
+    return re.sub(r"[\W_]+", "", norm(s))
 
 
 def bare(s: str) -> str:
@@ -202,8 +211,12 @@ def search(query: str, options, limit: int = 10) -> list[str]:
             score = 1
         elif all(t in n for t in q.split()):
             score = 2
-        elif all(any(w.startswith(t[:max(3, len(t) - 2)]) for w in n.split()) for t in q.split()):
-            score = 3  # інший порядок слів або відмінок: «Лесі Українки» / «Українки Лесі»
+        elif all(any(w.startswith(t[:max(3, len(t) - 2)]) or (len(w) >= 3 and t.startswith(w))
+                     for w in n.split()) for t in q.split()):
+            # інший порядок слів, відмінок чи скорочення: «Лесі Українки» / «Українки Лесі», «військове» / «Військ.»
+            score = 3
+        elif len(compact(q)) >= 3 and compact(q) in compact(o):
+            score = 4  # без пробілів і знаків: «вч0565» / «в/ч-0565»
         else:
             continue
         scored.append((score, len(o), o))
@@ -212,7 +225,21 @@ def search(query: str, options, limit: int = 10) -> list[str]:
 
 
 def is_exact(found: list[str], query: str) -> bool:
-    return len(found) == 1 or (bool(found) and norm(found[0]) == norm(query))
+    """Обирати одразу, лише коли збіг однозначний. ДТЕК часто записує одне місце кількома способами
+    («В/М 11», «Військове містечко №11», «Військове містечко-11») — тоді показуємо всі варіанти."""
+    if len(found) == 1:
+        return True
+    q = norm(query)
+    same = [f for f in found if norm(f) == q]
+    # «Військове містечко» є, але поруч «Військове містечко-21» — краще спитати, ніж вгадати
+    longer = [f for f in found if norm(f).startswith(q + " ")]
+    return len(same) == 1 and found[0] == same[0] and not longer
+
+
+def house_key(h: str):
+    """Природний порядок номерів: 2 < 10 < 10А < «в/ч-0565»."""
+    m = re.match(r"\d+", h)
+    return (int(m.group()) if m else 10 ** 9, h)
 
 
 def norm_house(s: str) -> str:
@@ -589,7 +616,32 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if kind == "g":
         await q.edit_message_text(f"Обрано: {group_label(val, site.names)}")
-        await save_and_show(update, ctx, [val])
+        if ud.get("city") and ud.get("street"):
+            # черга для конкретного місця, де ДТЕК не дав однозначної відповіді
+            parts = [ud["city"], ud["street"]] + ([ud["picked_house"]] if ud.get("picked_house") else [])
+            await save_and_show(update, ctx, [val], label=", ".join(parts), city=ud["city"], street=ud["street"])
+        else:
+            await save_and_show(update, ctx, [val])
+        return
+
+    if kind == "nh":
+        houses = ud.get("houses") or {}
+        sets = {tuple(sorted(v.get("sub_type_reason") or [])) for v in houses.values()} - {()}
+        label = f"{ud.get('city')}, {ud.get('street')}"
+        if len(sets) == 1:
+            await q.edit_message_text(f"Уся адреса «{label}» в одній черзі — номер не потрібен.")
+            await save_and_show(update, ctx, list(next(iter(sets))), label=label,
+                                city=ud.get("city"), street=ud.get("street"))
+        elif sets:
+            groups = sorted({g for gs in sets for g in gs})
+            buttons = [(group_label(g, site.names), f"g:{g}") for g in groups]
+            await q.edit_message_text(
+                f"Будинки за адресою «{label}» у різних чергах. Напишіть номер будинку "
+                "або оберіть чергу, якщо знаєте її (можна спитати в сусідів):",
+                reply_markup=kb(chunks(buttons, 3)))
+        else:
+            await q.edit_message_text("ДТЕК не вказує черги для цієї адреси. Якщо знаєте свою — оберіть:",
+                                      reply_markup=kb([[("🔢 Обрати чергу", "m:grp")]]))
         return
 
     cands = ud.get(f"cands_{kind}") or []
@@ -627,8 +679,37 @@ async def choose_city(update, ctx, city, edit=False):
 
 
 async def choose_street(update, ctx, street, edit=False):
-    ctx.user_data.update(street=street, step="house")
-    await ask(update, f"Вулиця: {street}\nНапишіть номер будинку:", edit=edit)
+    ud = ctx.user_data
+    ud.update(street=street, step="house")
+    try:
+        houses = await dtek.site(ud["region"]).get_houses(ud["city"], street)
+    except DtekError:
+        ud["step"] = "street"
+        await ask(update, "Сайт ДТЕК зараз не відповідає. Напишіть вулицю ще раз за хвилину.", edit=edit)
+        return
+    ud["houses"] = houses
+    if not houses:
+        ud["step"] = None
+        await ask(update, f"Вулиця: {street}\nДТЕК не має будинків за цією адресою. Якщо знаєте чергу — оберіть вручну, "
+                  "або спробуйте інший варіант назви: /start",
+                  kb([[("🔢 Обрати чергу", "m:grp")]]), edit=edit)
+        return
+    if len(houses) == 1:
+        # військова частина чи окремий об'єкт — запис лише один, номер питати немає сенсу
+        only = next(iter(houses))
+        await ask(update, f"Адреса: {street}\nЗа нею в ДТЕК лише один запис: {only}", edit=edit)
+        await choose_house(update, ctx, only)
+        return
+    items = sorted(houses, key=house_key)
+    rows = []
+    if len(items) <= 24:
+        ud["cands_h"] = items
+        rows = chunks([(h, f"h:{i}") for i, h in enumerate(items)], 4)
+        title = f"Вулиця: {street}\nОберіть будинок або напишіть номер:"
+    else:
+        title = f"Вулиця: {street}\nНапишіть номер будинку:"
+    rows.append([("🤷 Номера немає / не знаю", "nh:")])
+    await ask(update, title, kb(rows), edit=edit)
 
 
 async def choose_house(update, ctx, house):
@@ -637,6 +718,7 @@ async def choose_house(update, ctx, house):
     groups = list((houses.get(house) or {}).get("sub_type_reason") or [])
     if not groups:
         ud["step"] = None
+        ud["picked_house"] = house
         await update.effective_chat.send_message(
             "Для цього будинку ДТЕК не вказує черги. Якщо знаєте її — оберіть вручну.",
             reply_markup=kb([[("🔢 Обрати чергу", "m:grp")]]))
@@ -679,8 +761,9 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await offer(update, ctx, "s", found, "Оберіть вулицю:", 1)
 
         elif step == "house":
-            houses = await site.get_houses(ud["city"], ud["street"])
-            ud["houses"] = houses
+            houses = ud.get("houses")
+            if houses is None:
+                houses = ud["houses"] = await site.get_houses(ud["city"], ud["street"])
             if not houses:
                 await update.effective_chat.send_message(
                     "ДТЕК не повернув будинків для цієї вулиці.",
@@ -691,13 +774,16 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if exact:
                 await choose_house(update, ctx, exact[0])
                 return
-            similar = [h for h in houses if norm_house(h).startswith(want)][:20]
+            similar = sorted((h for h in houses if norm_house(h).startswith(want)), key=house_key)[:20]
             if not similar:
-                similar = sorted(houses, key=lambda h: (len(h), h))[:20]
+                similar = sorted(houses, key=house_key)[:20]
                 title = "Такого номера немає. Ось будинки цієї вулиці:"
             else:
                 title = "Оберіть будинок:"
-            await offer(update, ctx, "h", similar, title, 4)
+            ud["cands_h"] = similar
+            rows = chunks([(h, f"h:{i}") for i, h in enumerate(similar)], 4)
+            rows.append([("🤷 Номера немає / не знаю", "nh:")])
+            await ask(update, title, kb(rows))
     except DtekError:
         await update.effective_chat.send_message("Сайт ДТЕК зараз не відповідає. Напишіть ще раз за хвилину.")
 
