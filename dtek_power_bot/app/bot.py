@@ -350,8 +350,8 @@ HELP_TEXT = (
     "Якщо змін немає — мовчу, опівночі не турбую.\n"
     "• У кожному повідомленні: графік на сьогодні, чи є світло зараз, коли наступна зміна, і графік на завтра.\n"
     "• Нагадую перед відключенням (типово за 30 хв), а за бажанням — і коли за графіком мають дати світло.\n"
-    "• Якщо ви вказали адресу — пишу, коли ДТЕК оголошує аварійні чи планові роботи на будинку, "
-    "змінює час відновлення і коли їх завершено. Цих відключень немає в графіку черг.\n"
+    "• Якщо ви вказали адресу — пишу, коли на будинку фактично вимкнули світло (буває на пів години раніше "
+    "чи пізніше за графік), а також про аварійні чи планові роботи: початок, зміну часу й завершення.\n"
     "• Якщо будинок у двох чергах — показую обидві.\n"
     "• Що саме надсилати — у /settings.\n\n"
     f"{COMMANDS_TEXT}\n\n"
@@ -379,10 +379,12 @@ def settings_view(sub: dict) -> tuple[str, InlineKeyboardMarkup]:
     rows = [[(("✓ " if p["before"] == m else "") + t, f"set:before:{m}") for m, t in BEFORE_CHOICES],
             [(("Не писати" if p["restore"] else "Писати") + ", коли дають світло", "set:restore")]]
     if sub.get("house"):
-        lines.append(f"⚠️ Аварійні роботи за адресою: <b>{'так' if p['emergency'] else 'ні'}</b>")
-        rows.append([(("Вимкнути" if p["emergency"] else "Увімкнути") + " аварійні роботи", "set:emergency")])
+        lines.append(f"🔴 Писати, коли на будинку вимкнули світло, і про аварійні роботи: "
+                     f"<b>{'так' if p['emergency'] else 'ні'}</b>")
+        rows.append([(("Не писати" if p["emergency"] else "Писати") + " про відключення за адресою", "set:emergency")])
     else:
-        lines.append("⚠️ Аварійні роботи: <i>доступно, якщо вказати адресу з номером будинку (/start)</i>")
+        lines.append("🔴 Відключення й аварійні роботи за адресою: "
+                     "<i>доступно, якщо вказати адресу з номером будинку (/start)</i>")
     lines += ["", "<i>Зміни графіка я надсилаю завжди.</i>"]
     return "\n".join(lines), kb(rows)
 
@@ -423,6 +425,36 @@ async def allowed(update: Update) -> bool:
     return False
 
 
+def is_scheduled_outage(sub_type: str) -> bool:
+    """ДТЕК позначає на будинку і звичайне відключення за графіком: «Стабілізаційне відключення (Згідно графіку
+    погодинних відключень)». Тоді «Екстренні відключення (Аварійне без застосування графіку…)» — поза графіком."""
+    t = (sub_type or "").lower()
+    return "стабіліз" in t or ("згідно графіку" in t and "без застосування" not in t)
+
+
+def _hm(dtek_time: str) -> str:
+    """«14:33 23.10.2026» -> «14:33» (сьогодні) або як є."""
+    parts = (dtek_time or "").split()
+    if len(parts) == 2 and parts[1] == datetime.now(KYIV).strftime("%d.%m.%Y"):
+        return parts[0]
+    return dtek_time
+
+
+def scheduled_until(sub: dict, fact: dict | None, now: datetime | None = None) -> datetime | None:
+    """Кінець відключення за поточним графіком, до якого належить фактичне відключення зараз.
+    Реальний час розходиться з графіком на ±30 хв, тому шукаємо з запасом 45 хв."""
+    if not fact:
+        return None
+    now = now or datetime.now(KYIV)
+    best = None
+    for g in sub["groups"]:
+        for a, b in off_intervals(fact, g, now):
+            if b and a - timedelta(minutes=45) <= now < b + timedelta(minutes=45):
+                if best is None or abs((a - now).total_seconds()) < abs((best[0] - now).total_seconds()):
+                    best = (a, b)
+    return best[1] if best else None
+
+
 def emergency_state(h: dict | None) -> dict | None:
     """Аварійні/планові роботи на будинку з відповіді getHomeNum, або None, якщо їх немає."""
     if not h or not h.get("sub_type"):
@@ -431,7 +463,7 @@ def emergency_state(h: dict | None) -> dict | None:
 
 
 # ---------- надсилання графіка ----------
-async def current_outage_line(sub: dict) -> str:
+async def current_outage_line(sub: dict, fact: dict | None = None) -> str:
     """Аварійні/планові роботи, які сайт показує для конкретного будинку (їх немає в графіку черг)."""
     if not sub.get("house"):
         return ""
@@ -442,6 +474,16 @@ async def current_outage_line(sub: dict) -> str:
     h = houses.get(sub["house"]) or {}
     if not h.get("sub_type"):
         return ""
+    if is_scheduled_outage(h["sub_type"]):
+        until = scheduled_until(sub, fact)
+        line = "🔴 <b>За адресою зараз відключення</b>"
+        if h.get("start_date"):
+            line += f" — світло вимкнули о {html.escape(_hm(h['start_date']))}"
+        if until:
+            line += f"\nЗа графіком до {until.strftime('%H:%M')}"
+        elif h.get("end_date"):
+            line += f"\nОрієнтовно до {html.escape(_hm(h['end_date']))}"
+        return line
     line = f"⚠️ <b>За адресою зараз: {html.escape(h['sub_type'])}</b>"
     if h.get("start_date"):
         line += f"\nз {html.escape(h['start_date'])}"
@@ -454,7 +496,7 @@ async def send_schedule(bot, chat_id, sub: dict, header: str = "⚡️ <b>Гра
                         fact: dict | None = None):
     if fact is None:
         fact = await get_fact(sub["region"])
-    extra = await current_outage_line(sub)
+    extra = await current_outage_line(sub, fact)
     text = format_schedule(fact, sub["groups"], sub.get("label", ""), dtek.site(sub["region"]).names,
                            header=header, extra=extra)
     await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=REFRESH_KB)
@@ -483,7 +525,7 @@ async def save_and_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE, groups: 
         "✅ Готово. Я надішлю повідомлення, щойно ДТЕК змінить графік для вашої черги "
         "або опублікує графік на завтра."
         + (f" Перед кожним відключенням нагадаю за {p['before']} хв." if p["before"] else "")
-        + (" Також напишу про аварійні роботи на будинку." if sub.get("house") and p["emergency"] else "")
+        + (" Також напишу, коли на будинку вимкнуть світло, і про аварійні роботи." if sub.get("house") and p["emergency"] else "")
         + "\n/now — графік зараз, /settings — нагадування, /start — змінити адресу, /stop — відписатися."
     )
     if fact:
@@ -1162,12 +1204,25 @@ async def check_emergency(ctx: ContextTypes.DEFAULT_TYPE, region: str):
             continue
         text = None
         place = f"📍 {html.escape(sub.get('label', ''))}"
-        if new and (not old or old["type"] != new["type"]):
+        new_sched = bool(new) and is_scheduled_outage(new["type"])
+        old_sched = bool(old) and is_scheduled_outage(old["type"])
+        if new_sched:
+            # звичайне відключення за графіком: повідомляємо лише момент, коли світло фактично вимкнули
+            if not old_sched or old["start"] != new["start"]:
+                until = scheduled_until(sub, _fact_cache.get(region, (0, None))[1])
+                text = ("🔴 <b>Відключення</b>"
+                        + (f" — світло вимкнули о {html.escape(_hm(new['start']))}" if new["start"] else "")
+                        + f"\n{_place(sub, sub['groups'])}"
+                        + (f"\nЗа графіком до {until.strftime('%H:%M')}" if until
+                           else f"\nОрієнтовно до {html.escape(_hm(new['end']))}" if new["end"] else ""))
+        elif old_sched and not new:
+            pass  # відключення за графіком закінчилось — окремо не пишемо
+        elif new and (not old or old["type"] != new["type"]):
             text = (f"⚠️ <b>Відключення за вашою адресою</b>\n{place}\n{html.escape(new['type'])}"
                     + (f"\nПочаток: {html.escape(new['start'])}" if new["start"] else "")
                     + (f"\nОрієнтовно до: <b>{html.escape(new['end'])}</b>" if new["end"] else "")
                     + "\n<i>Це окремо від графіка черг — так повідомляє ДТЕК для вашого будинку.</i>")
-        elif new and old and new["end"] != old["end"] and new["end"]:
+        elif new and old and not old_sched and new["end"] != old["end"] and new["end"]:
             text = (f"🔄 <b>Змінився час відновлення світла</b>\n{place}\n{html.escape(new['type'])}\n"
                     f"Тепер орієнтовно до: <b>{html.escape(new['end'])}</b>"
                     + (f" (було до {html.escape(old['end'])})" if old["end"] else ""))
