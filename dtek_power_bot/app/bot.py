@@ -191,11 +191,62 @@ def compact(s: str) -> str:
     return re.sub(r"[\W_]+", "", norm(s))
 
 
+_PREFIX_LAT = re.compile(r"^(m|s|smt|sel|selyshche|s shche|vul|vulytsia|prov|provulok|prosp|bulv|pl|shose|"
+                         r"misto|selo|town|village|city|st|street|ave)\s+")
+
+
 def bare(s: str) -> str:
-    return _PREFIX.sub("", norm(s))
+    n = norm(s)
+    return _PREFIX_LAT.sub("", _PREFIX.sub("", n)) if has_latin(n) else _PREFIX.sub("", n)
 
 
-def search(query: str, options, limit: int = 10) -> list[str]:
+_NOT_PLACE = re.compile(r"^(\d{5}|україна|ukraine|.*област[ьі]|.*обл|.*oblast|.*район|.*raion|.*р н|.*громада|.*hromada)$")
+
+
+def address_parts(text: str) -> list[str]:
+    """«Vita-Poshtova, Kyiv Oblast, 08170» -> ["Vita-Poshtova"]: прибираємо область, район, країну, індекс."""
+    parts = [p.strip() for p in re.split(r"[,;]", text) if p.strip()]
+    keep = [p for p in parts if not _NOT_PLACE.match(norm(p))]
+    return keep or parts
+
+
+# Офіційна транслітерація (постанова КМУ №55, 2010) — так пишуть Google Maps і пошта: «Віта-Поштова» -> «vita-poshtova»
+_TR = {"а": "a", "б": "b", "в": "v", "г": "h", "ґ": "g", "д": "d", "е": "e", "є": "ie", "ж": "zh", "з": "z", "и": "y",
+       "і": "i", "ї": "i", "й": "i", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r", "с": "s",
+       "т": "t", "у": "u", "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "shch", "ь": "", "ю": "iu",
+       "я": "ia", "'": ""}
+_TR_START = {"є": "ye", "ї": "yi", "й": "y", "ю": "yu", "я": "ya"}
+
+
+def translit(s: str) -> str:
+    out, prev = [], " "
+    for ch in s:
+        out.append(_TR_START[ch] if ch in _TR_START and not prev.isalpha() else _TR.get(ch, ch))
+        prev = ch
+    # g/h і «зг» люди пишуть по-різному («Gostomel» / «Hostomel»)
+    return "".join(out).replace("zgh", "zh").replace("g", "h")
+
+
+def has_latin(s: str) -> bool:
+    return bool(re.search(r"[a-z]", s.lower()))
+
+
+def search(query: str, options, limit: int = 10, _latin: bool = False) -> list[str]:
+    if has_latin(query) and not _latin:
+        # назву написали латиницею — порівнюємо з транслітерованими варіантами ДТЕК
+        q_lat = translit(norm(query))
+        by_lat: dict[str, str] = {}
+        for o in options:
+            by_lat.setdefault(translit(norm(o)), o)
+        found = [by_lat[x] for x in search(q_lat, list(by_lat), limit, _latin=True)]
+        if found:
+            return found
+        # неофіційне написання: «Vishneve», «Hotiv», «Yasnogorodka»
+        loose = lambda x: re.sub(r"(?<=[a-z])i([aeu])", r"\1", x.replace("kh", "h").replace("y", "i").replace("j", "i"))
+        by_loose: dict[str, str] = {}
+        for lat, o in by_lat.items():
+            by_loose.setdefault(loose(lat), o)
+        return [by_loose[x] for x in search(loose(q_lat), list(by_loose), limit, _latin=True)]
     full = norm(query)
     q = bare(query) or full
     if not q:
@@ -847,6 +898,13 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if step == "city":
             streets = await site.get_streets()
             found = search(text, streets.keys())
+            if not found:
+                # адреса, скопійована з карти чи листа: «Vita-Poshtova, Kyiv Oblast, 08170»
+                for part in address_parts(text):
+                    found = search(part, streets.keys())
+                    if found:
+                        text = part
+                        break
             if not found:
                 await update.effective_chat.send_message("Не знайшов такого населеного пункту. Спробуйте інакше написати назву.")
             elif is_exact(found, text):

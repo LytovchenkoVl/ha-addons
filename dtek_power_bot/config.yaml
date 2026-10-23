@@ -1,5 +1,5 @@
 name: "ДТЕК графіки — Telegram бот"
-version: "1.7.0"
+version: "1.8.0"
 slug: dtek_power_bot
 description: "Надсилає в Telegram графік відключень ДТЕК за адресою або чергою, щойно він змінюється"
 url: "https://www.dtek-krem.com.ua/ua/shutdowns"
