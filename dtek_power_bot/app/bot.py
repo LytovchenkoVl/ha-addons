@@ -104,7 +104,8 @@ class Stats:
         for sub in subs.values():
             uid = sub.get("user_id")
             if uid and str(uid) not in self.data["users"]:
-                self.data["users"][str(uid)] = {"first": "", "last": ""}
+                self.data["users"][str(uid)] = {"first": "", "last": "",
+                                                "name": sub.get("name"), "username": sub.get("username")}
         self.dirty = True
         self.save()
 
@@ -112,16 +113,16 @@ class Stats:
     def today() -> str:
         return today_kyiv().isoformat()
 
-    def touch(self, user_id: int):
+    def touch(self, user):
         """Людина з доступом написала боту або натиснула кнопку."""
-        d, key = self.today(), str(user_id)
+        d, key = self.today(), str(user.id)
         u = self.data["users"].get(key)
         if self.data["denied"].pop(key, None) is not None:  # людині щойно дали доступ
             self.dirty = True
         if u is None:
-            self.data["users"][key] = {"first": d, "last": d}
-        elif u.get("last") != d:
-            u["last"] = d
+            self.data["users"][key] = {"first": d, "last": d, "name": user.full_name, "username": user.username}
+        elif u.get("last") != d or u.get("name") != user.full_name or u.get("username") != user.username:
+            u.update(last=d, name=user.full_name, username=user.username)
         elif not self.dirty:
             return
         self.dirty = True
@@ -254,7 +255,9 @@ HELP_TEXT = (
     "• Якщо ви вказали адресу — попереджаю про аварійні чи планові роботи на будинку, яких немає в графіку черг.\n"
     "• Якщо будинок у двох чергах — показую обидві.\n\n"
     f"{COMMANDS_TEXT}\n\n"
-    "Під кожним графіком є кнопка «🔄 Оновити»."
+    "Під кожним графіком є кнопка «🔄 Оновити».\n\n"
+    "<i>Вказана адреса зберігається на сервері власника бота і видна йому. "
+    "Щоб її видалити — /stop.</i>"
 )
 
 
@@ -272,7 +275,7 @@ def is_allowed(user_id: int | None, username: str | None) -> bool:
 async def allowed(update: Update) -> bool:
     user = update.effective_user
     if user and is_allowed(user.id, user.username):
-        stats.touch(user.id)
+        stats.touch(user)
         # людина знову пише боту (наприклад, після зміни токена) — відновлюємо сповіщення
         sub = store.get(update.effective_chat.id) if update.effective_chat else None
         if sub and sub.get("paused"):
@@ -334,6 +337,7 @@ async def save_and_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE, groups: 
     user = update.effective_user
     sub = {"region": region, "groups": groups, **addr,
            "user_id": user.id if user else None, "username": user.username if user else None,
+           "name": user.full_name if user else None,
            "sig": signature(fact, groups) if fact else None, "update": fact.get("update")}
     store.set(update.effective_chat.id, sub)
     ctx.user_data.clear()
@@ -467,8 +471,74 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if await allowed(update):
             await update.effective_chat.send_message("Ця команда доступна лише адміністраторам бота.")
         return
-    stats.touch(user.id)
-    await update.effective_chat.send_message(stats_text(), parse_mode=ParseMode.HTML)
+    stats.touch(user)
+    await update.effective_chat.send_message(stats_text(), parse_mode=ParseMode.HTML,
+                                             reply_markup=kb([[("👥 Люди та їхні адреси", "adm:users")]]))
+
+
+def users_text() -> list[str]:
+    """Усі люди зі статистики й підписок: хто, за чим стежить, коли заходив. Ділиться на кілька повідомлень."""
+    people: dict[str, dict] = {k: dict(v) for k, v in stats.data["users"].items()}
+    for chat_id, sub in store.data.items():
+        key = str(sub.get("user_id") or chat_id)
+        p = people.setdefault(key, {})
+        p.setdefault("name", sub.get("name"))
+        p.setdefault("username", sub.get("username"))
+        p.setdefault("subs", []).append((chat_id, sub))
+
+    def fmt_date(d):
+        return f"{d[8:10]}.{d[5:7]}" if d else "—"
+
+    # спершу ті, хто заходив нещодавно
+    order = sorted(people.items(), key=lambda kv: (kv[1].get("last") or "", kv[1].get("first") or ""), reverse=True)
+    blocks = []
+    for i, (uid, p) in enumerate(order, 1):
+        who = html.escape(p.get("name") or "Без імені")
+        if p.get("username"):
+            who += f" @{html.escape(p['username'])}"
+        lines = [f"<b>{i}. {who}</b> · <code>{uid}</code>"]
+        subs = p.get("subs") or []
+        for chat_id, sub in subs:
+            names = dtek.site(sub["region"]).names if sub["region"] in dtek.sites else None
+            groups = ", ".join(group_label(g, names) for g in sub.get("groups", []))
+            what = f"{html.escape(sub['label'])} · {groups}" if sub.get("label") else groups
+            if sub.get("paused"):
+                state = "⏸ на паузі"
+            elif not is_allowed(sub.get("user_id"), sub.get("username")):
+                state = "⛔ без доступу"
+            else:
+                state = "🔔"
+            where = REGIONS.get(sub["region"], {}).get("name", sub["region"])
+            group_chat = " (груповий чат)" if str(chat_id) != uid else ""
+            lines.append(f"{state} 📍 {what}\n      {where}{group_chat}")
+        if not subs:
+            lines.append("— адресу чи чергу ще не вказав")
+        lines.append(f"<i>перший вхід {fmt_date(p.get('first'))} · останній {fmt_date(p.get('last'))}</i>")
+        blocks.append("\n".join(lines))
+    if not blocks:
+        return ["Поки що ніхто не користувався ботом."]
+
+    # Telegram приймає до 4096 символів в одному повідомленні
+    header = f"👥 <b>Люди та їхні адреси</b> ({len(blocks)})\n\n"
+    pages, cur = [], header
+    for b in blocks:
+        if len(cur) + len(b) + 2 > 3800:
+            pages.append(cur.rstrip())
+            cur = ""
+        cur += b + "\n\n"
+    pages.append(cur.rstrip())
+    return pages
+
+
+async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id, user.username):
+        if await allowed(update):
+            await update.effective_chat.send_message("Ця команда доступна лише адміністраторам бота.")
+        return
+    stats.touch(user)
+    for page in users_text():
+        await update.effective_chat.send_message(page, parse_mode=ParseMode.HTML)
 
 
 # ---------- кнопки ----------
@@ -482,6 +552,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if kind == "now":
         await cmd_now(update, ctx)
+        return
+
+    if kind == "adm" and val == "users":
+        await cmd_users(update, ctx)
         return
 
     if kind == "r":
@@ -686,7 +760,8 @@ async def post_init(app: Application):
     for admin_id in ADMIN_IDS:
         try:
             await app.bot.set_my_commands(
-                [*(await app.bot.get_my_commands()), BotCommand("stats", "Статистика бота")],
+                [*(await app.bot.get_my_commands()), BotCommand("stats", "Статистика бота"),
+                 BotCommand("users", "Люди та їхні адреси")],
                 scope=BotCommandScopeChat(admin_id))
         except Exception as e:  # noqa: BLE001 — людина ще не писала боту
             log.info("меню /stats для %s поки не встановлено: %s", admin_id, e)
@@ -710,6 +785,7 @@ def main():
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
