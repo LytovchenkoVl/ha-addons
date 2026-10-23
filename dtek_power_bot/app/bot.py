@@ -88,11 +88,25 @@ class Stats:
             self.data = json.loads(path.read_text())
         except (FileNotFoundError, json.JSONDecodeError):
             self.data = {}
-        for k in ("users", "sent", "denied"):
+        for k in ("users", "sent", "denied", "polls"):
             self.data.setdefault(k, {})
         self.dirty = False
-        # стан перевірок сайту за регіонами (лише в пам'яті)
-        self.polls: dict[str, dict] = {}
+        if "since" not in self.data:  # коли почали вести статистику — видно, якщо дані колись зникнуть
+            self.data["since"] = datetime.now(KYIV).strftime("%d.%m.%Y %H:%M")
+            self.dirty = True
+        # стан перевірок сайту за регіонами зберігається, щоб після перезапуску було видно останній результат
+        self.polls: dict[str, dict] = self.data["polls"]
+
+    def started(self, subs: dict):
+        """Запуск бота: рахуємо перезапуски й додаємо людей з підписками, які користувались ботом
+        ще до появи статистики (дата першого входу для них невідома)."""
+        self.data["restarts"] = self.data.get("restarts", 0) + 1
+        for sub in subs.values():
+            uid = sub.get("user_id")
+            if uid and str(uid) not in self.data["users"]:
+                self.data["users"][str(uid)] = {"first": "", "last": ""}
+        self.dirty = True
+        self.save()
 
     @staticmethod
     def today() -> str:
@@ -102,11 +116,13 @@ class Stats:
         """Людина з доступом написала боту або натиснула кнопку."""
         d, key = self.today(), str(user_id)
         u = self.data["users"].get(key)
+        if self.data["denied"].pop(key, None) is not None:  # людині щойно дали доступ
+            self.dirty = True
         if u is None:
             self.data["users"][key] = {"first": d, "last": d}
         elif u.get("last") != d:
             u["last"] = d
-        else:
+        elif not self.dirty:
             return
         self.dirty = True
         self.save()
@@ -396,7 +412,8 @@ def stats_text() -> str:
         "📊 <b>Статистика бота</b>",
         "",
         "👥 <b>Люди</b>",
-        f"Запускали бота: {len(stats.data['users'])}",
+        f"Запускали бота: {len(stats.data['users'])}"
+        + (f" · без доступу писали: {len(stats.data['denied'])}" if stats.data["denied"] else ""),
         f"Нових: сьогодні {sum(u['first'] == t for u in users)}, за 7 днів {sum(u['first'] >= week_ago for u in users)}",
         f"Заходили в бота: сьогодні {sum(u['last'] == t for u in users)}, за 7 днів {sum(u['last'] >= week_ago for u in users)}",
         "",
@@ -427,7 +444,13 @@ def stats_text() -> str:
             lines.append(f"⚠️ {name}: помилка{since}{ok}\n<code>{html.escape(p['error'][:150])}</code>")
         else:
             lines.append(f"✅ {name}: перевірено {_fmt_ago(p['ok'])}")
-    lines.append(f"Перевірка кожні {POLL_MINUTES} хв · працює {up // 86400} д {up % 86400 // 3600} год {up % 3600 // 60} хв")
+    lines += [
+        "",
+        "⚙️ <b>Бот</b>",
+        f"Запущено {_fmt_ago(STARTED_AT)} · працює без перезапуску {up // 86400} д {up % 86400 // 3600} год {up % 3600 // 60} хв",
+        f"Перезапусків: {stats.data.get('restarts', 0)} · статистика ведеться з {stats.data['since']}",
+        f"Перевірка сайту кожні {POLL_MINUTES} хв",
+    ]
 
     denied = list(stats.data["denied"].items())[-5:]
     if denied and not ALLOW_ALL:
@@ -617,8 +640,10 @@ async def poll(ctx: ContextTypes.DEFAULT_TYPE):
             if not st.get("error"):
                 st["error_at"] = time.time()
             st["error"] = str(e)
+            stats.dirty = True
             continue
         stats.polls[region] = {"ok": time.time()}
+        stats.dirty = True
         for chat_id, sub in list(subs.items()):
             if sub["region"] != region:
                 continue
@@ -667,7 +692,9 @@ async def post_init(app: Application):
             log.info("меню /stats для %s поки не встановлено: %s", admin_id, e)
     # опис бота (порожній чат і профіль) задається вручну в @BotFather: /setdescription, /setabouttext
     app.job_queue.run_repeating(poll, interval=POLL_MINUTES * 60, first=15)
-    log.info("Бот запущено. Перевірка кожні %d хв, підписок: %d", POLL_MINUTES, len(store.data))
+    stats.started(store.data)
+    log.info("Бот запущено. Перевірка кожні %d хв, підписок: %d, людей у статистиці: %d (файл %s)",
+             POLL_MINUTES, len(store.data), len(stats.data["users"]), stats.path)
 
 
 async def post_shutdown(app: Application):
