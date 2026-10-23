@@ -165,6 +165,14 @@ def format_schedule(fact: dict, groups: list[str], label: str = "", names: dict 
     if extra:
         lines.append(extra)
 
+    if not days:
+        # ДТЕК зараз не публікує графіків для регіону (наприклад, відключень немає)
+        if label:
+            lines[1] += " · " + html.escape(", ".join(group_label(g, names) for g in groups))
+        lines += ["", "✅ Зараз ДТЕК не публікує графіків відключень для вашого регіону.",
+                  "Щойно графік з'явиться — я напишу."]
+        return "\n".join(lines)
+
     for g in groups:
         lines.append("")
         if len(groups) > 1 or not label:

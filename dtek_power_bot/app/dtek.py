@@ -16,10 +16,15 @@ from playwright.async_api import Browser, BrowserContext, Page, async_playwright
 log = logging.getLogger("dtek")
 
 REGIONS = {
-    "kem": {"name": "Київ", "full": "ДТЕК Київські електромережі", "url": "https://www.dtek-kem.com.ua"},
-    "krem": {"name": "Київська область", "full": "ДТЕК Київські регіональні електромережі", "url": "https://www.dtek-krem.com.ua"},
-    "dnem": {"name": "Дніпропетровська область", "full": "ДТЕК Дніпровські електромережі", "url": "https://www.dtek-dnem.com.ua"},
-    "oem": {"name": "Одеська область", "full": "ДТЕК Одеські електромережі", "url": "https://www.dtek-oem.com.ua"},
+    # Сайт КЕМ (місто Київ) не має населених пунктів: лише список вулиць, і будинки шукаються за вулицею
+    "kem": {"name": "Київ", "full": "ДТЕК Київські електромережі", "url": "https://www.dtek-kem.com.ua",
+            "city": "м. Київ"},
+    "krem": {"name": "Київська область", "full": "ДТЕК Київські регіональні електромережі", "url": "https://www.dtek-krem.com.ua",
+             "example": "Бровари"},
+    "dnem": {"name": "Дніпропетровська область", "full": "ДТЕК Дніпровські електромережі", "url": "https://www.dtek-dnem.com.ua",
+             "example": "Павлоград"},
+    "oem": {"name": "Одеська область", "full": "ДТЕК Одеські електромережі", "url": "https://www.dtek-oem.com.ua",
+            "example": "Чорноморськ"},
 }
 
 # Повний перезапуск сторінки раз на стільки секунд (оновлює cookies і CSRF)
@@ -61,6 +66,7 @@ class DtekSite:
         self.loaded_at = 0.0
         self.lock = asyncio.Lock()
         self.streets: dict[str, list[str]] = {}
+        self.has_cities = True
         self.names: dict[str, str] = {}
 
     async def _load(self):
@@ -81,7 +87,14 @@ class DtekSite:
         info = await self.page.evaluate(
             "() => ({streets: DisconSchedule.streets, names: (DisconSchedule.preset||{}).sch_names || {}})"
         )
-        self.streets = info.get("streets") or {}
+        streets = info.get("streets") or {}
+        if isinstance(streets, list):
+            # Київ: замість {населений пункт: [вулиці]} сайт віддає просто [вулиці]
+            self.has_cities = False
+            self.streets = {REGIONS[self.key].get("city", "—"): streets}
+        else:
+            self.has_cities = True
+            self.streets = streets
         self.names = info.get("names") or {}
         self.loaded_at = time.monotonic()
         log.info("[%s] сторінка готова: %d населених пунктів", self.key, len(self.streets))
@@ -125,8 +138,10 @@ class DtekSite:
 
     async def get_houses(self, city: str, street: str) -> dict:
         """Будинки вулиці: {номер: {sub_type_reason: [черги], sub_type, start_date, end_date, ...}}."""
+        await self.get_streets()  # сторінка має бути завантажена, щоб знати, чи є на сайті поле «населений пункт»
+        fields = ([("city", city)] if self.has_cities else []) + [("street", street), ("updateFact", "01.01.2000 00:00")]
         params = [("method", "getHomeNum")]
-        for i, (n, v) in enumerate([("city", city), ("street", street), ("updateFact", "01.01.2000 00:00")]):
+        for i, (n, v) in enumerate(fields):
             params += [(f"data[{i}][name]", n), (f"data[{i}][value]", v)]
         data = await self._ajax(params)
         houses = data.get("data") or {}

@@ -236,6 +236,10 @@ def is_exact(found: list[str], query: str) -> bool:
     return len(same) == 1 and found[0] == same[0] and not longer
 
 
+def group_sort_key(g: str):
+    return tuple(int(x) for x in re.findall(r"\d+", g)) or (10 ** 6,)
+
+
 def house_key(h: str):
     """Природний порядок номерів: 2 < 10 < 10А < «в/ч-0565»."""
     m = re.match(r"\d+", h)
@@ -615,14 +619,28 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except DtekError:
             await q.edit_message_text("Сайт ДТЕК не відповідає. Спробуйте /start трохи згодом.")
             return
-        groups = sorted(site.names) or [f"GPV{a}.{b}" for a in range(1, 7) for b in (1, 2)]
+        fact = _fact_cache.get(ud["region"], (0, {}))[1]
+        in_fact = {g for day in (fact.get("data") or {}).values() if isinstance(day, dict) for g in day} \
+            if isinstance(fact.get("data"), dict) else set()
+        # у Києві 60 черг — показуємо ті, що є в графіку, у природному порядку (1.1, 1.2, 2.1 … 10.1)
+        groups = sorted(in_fact or site.names or {f"GPV{a}.{b}" for a in range(1, 7) for b in (1, 2)}, key=group_sort_key)[:100]
         buttons = [(group_label(g, site.names).replace("Черга ", ""), f"g:{g}") for g in groups]
-        await q.edit_message_text("Оберіть чергу:", reply_markup=kb(chunks(buttons, 4)))
+        await q.edit_message_text("Оберіть чергу:", reply_markup=kb(chunks(buttons, 5 if len(buttons) > 24 else 4)))
         return
 
     if kind == "m" and val == "addr":
+        try:
+            streets = await site.get_streets()
+        except DtekError:
+            await q.edit_message_text("Сайт ДТЕК зараз не відповідає. Спробуйте /start трохи згодом.")
+            return
+        if len(streets) == 1:
+            # Київ: окремого кроку «населений пункт» на сайті немає — одразу питаємо вулицю
+            await choose_city(update, ctx, next(iter(streets)), edit=True)
+            return
         ud["step"] = "city"
-        await q.edit_message_text("Напишіть назву населеного пункту (наприклад: Бровари):")
+        example = REGIONS[ud["region"]].get("example")
+        await q.edit_message_text("Напишіть назву населеного пункту" + (f" (наприклад: {example}):" if example else ":"))
         return
 
     if kind == "g":
