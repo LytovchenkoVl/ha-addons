@@ -17,7 +17,8 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, Con
                           MessageHandler, filters)
 
 from dtek import REGIONS, Dtek, DtekError
-from schedule import KYIV, group_label, has_changed, format_schedule, signature, today_kyiv
+from schedule import (KYIV, fmt_when, format_schedule, group_label, has_changed, next_off_after, off_intervals,
+                      signature, today_kyiv)
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -140,12 +141,14 @@ class Stats:
         self.dirty = True
         self.save()
 
-    def sent(self, n: int = 1):
+    def sent(self, n: int = 1, kind: str = "sent"):
+        """kind: sent — зміни графіка, remind — нагадування, emergency — аварійні роботи."""
+        bucket = self.data.setdefault(kind, {})
         d = self.today()
-        self.data["sent"][d] = self.data["sent"].get(d, 0) + n
+        bucket[d] = bucket.get(d, 0) + n
         cutoff = (today_kyiv() - timedelta(days=60)).isoformat()
-        for k in [k for k in self.data["sent"] if k < cutoff]:
-            del self.data["sent"][k]
+        for k in [k for k in bucket if k < cutoff]:
+            del bucket[k]
         self.dirty = True
 
     def save(self):
@@ -328,6 +331,7 @@ COMMANDS_TEXT = (
     "<b>Команди</b>\n"
     "/now — графік на сьогодні й завтра\n"
     "/start — вказати або змінити адресу чи чергу\n"
+    "/settings — нагадування й сповіщення\n"
     "/stop — вимкнути сповіщення\n"
     "/help — що вміє бот"
 )
@@ -345,13 +349,42 @@ HELP_TEXT = (
     "• Пишу, щойно ДТЕК змінює графік вашої черги або публікує графік на завтра. "
     "Якщо змін немає — мовчу, опівночі не турбую.\n"
     "• У кожному повідомленні: графік на сьогодні, чи є світло зараз, коли наступна зміна, і графік на завтра.\n"
-    "• Якщо ви вказали адресу — попереджаю про аварійні чи планові роботи на будинку, яких немає в графіку черг.\n"
-    "• Якщо будинок у двох чергах — показую обидві.\n\n"
+    "• Нагадую перед відключенням (типово за 30 хв), а за бажанням — і коли за графіком мають дати світло.\n"
+    "• Якщо ви вказали адресу — пишу, коли ДТЕК оголошує аварійні чи планові роботи на будинку, "
+    "змінює час відновлення і коли їх завершено. Цих відключень немає в графіку черг.\n"
+    "• Якщо будинок у двох чергах — показую обидві.\n"
+    "• Що саме надсилати — у /settings.\n\n"
     f"{COMMANDS_TEXT}\n\n"
     "Під кожним графіком є кнопка «🔄 Оновити».\n\n"
     "<i>Вказана адреса зберігається на сервері власника бота і видна йому. "
     "Щоб її видалити — /stop.</i>"
 )
+
+
+# ---------- налаштування сповіщень ----------
+DEFAULT_PREFS = {"before": 30, "restore": False, "emergency": True}
+BEFORE_CHOICES = [(15, "15 хв"), (30, "30 хв"), (60, "1 год"), (0, "Не треба")]
+
+
+def prefs(sub: dict) -> dict:
+    return {**DEFAULT_PREFS, **(sub.get("prefs") or {})}
+
+
+def settings_view(sub: dict) -> tuple[str, InlineKeyboardMarkup]:
+    p = prefs(sub)
+    before = next((t for m, t in BEFORE_CHOICES if m == p["before"]), f"{p['before']} хв")
+    lines = ["⚙️ <b>Нагадування та сповіщення</b>", "",
+             f"⏰ Нагадувати перед відключенням: <b>{'ні' if not p['before'] else 'за ' + before}</b>",
+             f"💡 Писати, коли за графіком дають світло: <b>{'так' if p['restore'] else 'ні'}</b>"]
+    rows = [[(("✓ " if p["before"] == m else "") + t, f"set:before:{m}") for m, t in BEFORE_CHOICES],
+            [(("Не писати" if p["restore"] else "Писати") + ", коли дають світло", "set:restore")]]
+    if sub.get("house"):
+        lines.append(f"⚠️ Аварійні роботи за адресою: <b>{'так' if p['emergency'] else 'ні'}</b>")
+        rows.append([(("Вимкнути" if p["emergency"] else "Увімкнути") + " аварійні роботи", "set:emergency")])
+    else:
+        lines.append("⚠️ Аварійні роботи: <i>доступно, якщо вказати адресу з номером будинку (/start)</i>")
+    lines += ["", "<i>Зміни графіка я надсилаю завжди.</i>"]
+    return "\n".join(lines), kb(rows)
 
 
 # ---------- доступ ----------
@@ -388,6 +421,13 @@ async def allowed(update: Update) -> bool:
     if update.effective_chat:
         await update.effective_chat.send_message(msg, parse_mode=ParseMode.HTML)
     return False
+
+
+def emergency_state(h: dict | None) -> dict | None:
+    """Аварійні/планові роботи на будинку з відповіді getHomeNum, або None, якщо їх немає."""
+    if not h or not h.get("sub_type"):
+        return None
+    return {"type": h["sub_type"], "start": h.get("start_date") or "", "end": h.get("end_date") or ""}
 
 
 # ---------- надсилання графіка ----------
@@ -428,15 +468,23 @@ async def save_and_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE, groups: 
         await update.effective_chat.send_message("Не вдалося отримати графік із сайту ДТЕК. Спробуйте /now трохи згодом.")
         fact = {}
     user = update.effective_user
-    sub = {"region": region, "groups": groups, **addr,
+    old = store.get(update.effective_chat.id) or {}
+    if addr.get("house"):
+        h = (ctx.user_data.get("houses") or {}).get(addr["house"])
+        addr.update(emergency=emergency_state(h), em_checked=True)
+    sub = {"region": region, "groups": groups, **addr, "prefs": old.get("prefs") or {},
            "user_id": user.id if user else None, "username": user.username if user else None,
            "name": user.full_name if user else None,
            "sig": signature(fact, groups) if fact else None, "update": fact.get("update")}
     store.set(update.effective_chat.id, sub)
     ctx.user_data.clear()
+    p = prefs(sub)
     await update.effective_chat.send_message(
         "✅ Готово. Я надішлю повідомлення, щойно ДТЕК змінить графік для вашої черги "
-        "або опублікує графік на завтра.\n/now — графік зараз, /start — змінити адресу, /stop — відписатися."
+        "або опублікує графік на завтра."
+        + (f" Перед кожним відключенням нагадаю за {p['before']} хв." if p["before"] else "")
+        + (" Також напишу про аварійні роботи на будинку." if sub.get("house") and p["emergency"] else "")
+        + "\n/now — графік зараз, /settings — нагадування, /start — змінити адресу, /stop — відписатися."
     )
     if fact:
         await send_schedule(ctx.bot, update.effective_chat.id, sub, fact=fact)
@@ -469,6 +517,17 @@ async def cmd_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send_schedule(ctx.bot, update.effective_chat.id, sub)
     except DtekError:
         await update.effective_chat.send_message("Сайт ДТЕК зараз не відповідає. Спробуйте за хвилину.")
+
+
+async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await allowed(update):
+        return
+    sub = store.get(update.effective_chat.id)
+    if not sub:
+        await update.effective_chat.send_message("Спершу вкажіть адресу або чергу: /start")
+        return
+    text, markup = settings_view(sub)
+    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -526,8 +585,10 @@ def stats_text() -> str:
         lines.append(f"• {REGIONS.get(k, {}).get('name', k)}: {n}")
     lines += [
         "",
-        "✉️ <b>Сповіщень про зміни</b>",
-        f"Сьогодні {sent.get(t, 0)}, за 7 днів {sum(v for k, v in sent.items() if k >= week_ago)}",
+        "✉️ <b>Надіслано</b> (сьогодні / за 7 днів)",
+        *[f"{title}: {b.get(t, 0)} / {sum(v for k, v in b.items() if k >= week_ago)}"
+          for title, b in (("Зміни графіка", sent), ("Нагадування", stats.data.get("remind", {})),
+                           ("Аварійні роботи", stats.data.get("emergency", {})))],
         "",
         "🌐 <b>Сайт ДТЕК</b>",
     ]
@@ -649,6 +710,25 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if kind == "adm" and val == "users":
         await cmd_users(update, ctx)
+        return
+
+    if kind == "set":
+        sub = store.get(update.effective_chat.id)
+        if not sub:
+            await q.edit_message_text("Спершу вкажіть адресу або чергу: /start")
+            return
+        p = sub.setdefault("prefs", {})
+        what, _, arg = val.partition(":")
+        if what == "before":
+            p["before"] = int(arg)
+        elif what in ("restore", "emergency"):
+            p[what] = not prefs(sub)[what]
+        store.save()
+        text, markup = settings_view(sub)
+        try:
+            await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        except Exception:  # noqa: BLE001 — «message is not modified», якщо натиснули вже вибране
+            pass
         return
 
     if kind == "r":
@@ -983,8 +1063,122 @@ async def poll(ctx: ContextTypes.DEFAULT_TYPE):
                     log.warning("не вдалося надіслати в %s: %s", chat_id, e)
                     continue
             sub["sig"], sub["update"] = new, fact.get("update")
+        await check_emergency(ctx, region)
     store.save()
     stats.save()
+
+
+async def _send(ctx, chat_id, sub: dict, text: str, kind: str) -> bool:
+    try:
+        await ctx.bot.send_message(int(chat_id), text, parse_mode=ParseMode.HTML, reply_markup=REFRESH_KB)
+        stats.sent(kind=kind)
+        return True
+    except Forbidden:
+        log.info("чат %s недоступний для бота — призупиняю сповіщення", chat_id)
+        sub["paused"] = True
+    except Exception as e:  # noqa: BLE001
+        log.warning("не вдалося надіслати в %s: %s", chat_id, e)
+    return False
+
+
+def _place(sub: dict, groups: list[str]) -> str:
+    names = dtek.site(sub["region"]).names
+    g = html.escape(", ".join(group_label(x, names) for x in groups))
+    return f"📍 {html.escape(sub['label'])} · {g}" if sub.get("label") else f"🔢 {g}"
+
+
+async def remind(ctx: ContextTypes.DEFAULT_TYPE):
+    """Щохвилини: нагадування перед відключенням і в момент, коли за графіком мають дати світло."""
+    now = datetime.now(KYIV)
+    changed = False
+    for chat_id, sub in list(store.data.items()):
+        if sub.get("paused") or not is_allowed(sub.get("user_id"), sub.get("username")):
+            continue
+        cached = _fact_cache.get(sub["region"])
+        if not cached:
+            continue
+        fact, p = cached[1], prefs(sub)
+        sent = sub.setdefault("reminded", [])
+        # події з кількох черг одного будинку об'єднуємо, щоб не дублювати
+        before: dict[datetime, tuple[list[str], datetime | None]] = {}
+        restore: dict[datetime, list[str]] = {}
+        for g in sub["groups"]:
+            for start, end in off_intervals(fact, g, now):
+                if p["before"] and start - timedelta(minutes=p["before"]) <= now < start:
+                    gs, e = before.setdefault(start, ([], end))
+                    gs.append(g)
+                if p["restore"] and end and end <= now < end + timedelta(minutes=10):
+                    restore.setdefault(end, []).append(g)
+        for start, (gs, end) in sorted(before.items()):
+            key = f"b|{start.isoformat()}"
+            if key in sent:
+                continue
+            mins = max(1, round((start - now).total_seconds() / 60))
+            text = (f"⏰ <b>Через {mins} хв відключення</b> — {fmt_when(start, now)}\n{_place(sub, gs)}\n"
+                    f"🔴 {start.strftime('%H:%M')}–{end.strftime('%H:%M') if end else '…'}"
+                    + ("" if end else " (кінець ще невідомий — графіка на наступну добу немає)")
+                    + "\n<i>Встигніть зарядити телефон і павербанк.</i>")
+            if await _send(ctx, chat_id, sub, text, "remind"):
+                log.info("нагадування перед відключенням %s для чату %s", start, chat_id)
+            sent.append(key)
+            changed = True
+        for end, gs in sorted(restore.items()):
+            key = f"r|{end.isoformat()}"
+            if key in sent:
+                continue
+            nxt = next_off_after(fact, sub["groups"], end)
+            text = (f"💡 <b>За графіком світло вже має бути</b> (з {end.strftime('%H:%M')})\n{_place(sub, gs)}\n"
+                    + (f"Наступне відключення {fmt_when(nxt, now)}." if nxt else "Інших відключень у графіку поки немає."))
+            await _send(ctx, chat_id, sub, text, "remind")
+            sent.append(key)
+            changed = True
+        if len(sent) > 60:
+            del sent[:-60]
+    if changed:
+        store.save()
+        stats.save()
+
+
+async def check_emergency(ctx: ContextTypes.DEFAULT_TYPE, region: str):
+    """Аварійні й планові роботи на будинках підписників: початок, зміна часу відновлення, завершення."""
+    subs = [(cid, s) for cid, s in store.data.items()
+            if s["region"] == region and s.get("house") and prefs(s)["emergency"]
+            and not s.get("paused") and is_allowed(s.get("user_id"), s.get("username"))]
+    houses_by_street: dict[tuple[str, str], dict] = {}
+    for chat_id, sub in subs:
+        key = (sub.get("city") or "", sub["street"])
+        if key not in houses_by_street:
+            try:
+                houses_by_street[key] = await dtek.site(region).get_houses(*key)
+            except DtekError as e:
+                log.warning("[%s] не вдалося перевірити аварійні роботи для %s: %s", region, key, e)
+                houses_by_street[key] = None
+        houses = houses_by_street[key]
+        if not houses or sub["house"] not in houses:
+            continue  # немає даних — нічого не вирішуємо
+        new, old = emergency_state(houses[sub["house"]]), sub.get("emergency")
+        if not sub.get("em_checked"):
+            sub.update(emergency=new, em_checked=True)  # перша перевірка: лише запам'ятати стан
+            continue
+        text = None
+        place = f"📍 {html.escape(sub.get('label', ''))}"
+        if new and (not old or old["type"] != new["type"]):
+            text = (f"⚠️ <b>Відключення за вашою адресою</b>\n{place}\n{html.escape(new['type'])}"
+                    + (f"\nПочаток: {html.escape(new['start'])}" if new["start"] else "")
+                    + (f"\nОрієнтовно до: <b>{html.escape(new['end'])}</b>" if new["end"] else "")
+                    + "\n<i>Це окремо від графіка черг — так повідомляє ДТЕК для вашого будинку.</i>")
+        elif new and old and new["end"] != old["end"] and new["end"]:
+            text = (f"🔄 <b>Змінився час відновлення світла</b>\n{place}\n{html.escape(new['type'])}\n"
+                    f"Тепер орієнтовно до: <b>{html.escape(new['end'])}</b>"
+                    + (f" (було до {html.escape(old['end'])})" if old["end"] else ""))
+        elif old and not new:
+            text = (f"✅ <b>ДТЕК завершив роботи за вашою адресою</b>\n{place}\n"
+                    f"<i>{html.escape(old['type'])}</i>\n"
+                    "Якщо світла досі немає, а за графіком має бути — повідомте ДТЕК.")
+        sub["emergency"] = new
+        if text:
+            log.info("[%s] аварійні роботи за адресою чату %s: %s -> %s", region, chat_id, old, new)
+            await _send(ctx, chat_id, sub, text, "emergency")
 
 
 async def post_init(app: Application):
@@ -992,6 +1186,7 @@ async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("now", "Графік на сьогодні й завтра"),
         BotCommand("start", "Вказати або змінити адресу чи чергу"),
+        BotCommand("settings", "Нагадування та сповіщення"),
         BotCommand("stop", "Вимкнути сповіщення"),
         BotCommand("help", "Що вміє бот"),
     ])
@@ -1006,6 +1201,7 @@ async def post_init(app: Application):
             log.info("меню /stats для %s поки не встановлено: %s", admin_id, e)
     # опис бота (порожній чат і профіль) задається вручну в @BotFather: /setdescription, /setabouttext
     app.job_queue.run_repeating(poll, interval=POLL_MINUTES * 60, first=15)
+    app.job_queue.run_repeating(remind, interval=60, first=40)
     stats.started(store.data)
     log.info("Бот запущено. Перевірка кожні %d хв, підписок: %d, людей у статистиці: %d (файл %s)",
              POLL_MINUTES, len(store.data), len(stats.data["users"]), stats.path)
@@ -1023,6 +1219,7 @@ def main():
     app.add_handler(CommandHandler("now", cmd_now))
     app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CallbackQueryHandler(on_button))

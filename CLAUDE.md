@@ -39,6 +39,13 @@
   Латиниця: `search()` транслітерує варіанти ДТЕК за КМУ-2010 («Vita-Poshtova», «Boryspil»), g=h, потім «вільне»
   порівняння (y=i, kh=h: «Vishneve», «Hotiv»). `address_parts()` прибирає область/район/країну/індекс із вставленої адреси.
 
+- Нагадування: job `remind` щохвилини за `_fact_cache` (оновлює `poll`). `off_intervals()` склеює дні, тож 22:00–02:00 —
+  одне відключення; кінець None, якщо графіка на наступну добу ще немає. Без дублів через `sub['reminded']`
+  (ключі `b|<початок>`, `r|<кінець>`). Налаштування людини — `sub['prefs']` (before/restore/emergency), `/settings`.
+- Аварійні роботи: `check_emergency()` в `poll` для підписок з `house`; стан `sub['emergency']` = {type,start,end}
+  з getHomeNum (`sub_type`, `start_date`, `end_date`); перша перевірка лише запам'ятовує (`em_checked`).
+  Лічильники в stats: `sent` (зміни), `remind`, `emergency`.
+
 ## Перед випуском
 
 - Збільшити `version` у `dtek_power_bot/config.yaml`, інакше HA не покаже оновлення.

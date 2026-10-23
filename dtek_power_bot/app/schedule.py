@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import html
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 KYIV = ZoneInfo("Europe/Kyiv")
@@ -201,3 +201,43 @@ def format_schedule(fact: dict, groups: list[str], label: str = "", names: dict 
             tomorrow_title = "<b>Завтра</b>"
             lines.append(f"{tomorrow_title}: графіка ще немає")
     return "\n".join(lines).replace("\n\n\n", "\n\n")
+
+
+def _at(day0: date, minutes: int) -> datetime:
+    """Хвилини від початку day0 (можуть бути > 24 год) -> час за Києвом. Переведення годинника враховує zoneinfo."""
+    d = day0 + timedelta(days=minutes // 1440)
+    m = minutes % 1440
+    return datetime(d.year, d.month, d.day, m // 60, m % 60, tzinfo=KYIV)
+
+
+def off_intervals(fact: dict, group: str, now: datetime | None = None) -> list[tuple[datetime, datetime | None]]:
+    """Відключення черги від сьогодні й далі одним безперервним рядком днів, щоб відключення 22:00–02:00
+    не розпадалося на два. Кінець None — відключення триває до кінця відомих даних (графіка на наступний день ще немає)."""
+    t = today_kyiv(now)
+    days = fact_days(fact)
+    slots, d = "", t
+    while d in days and group in days[d]:
+        slots += hours_to_slots(days[d][group])
+        d += timedelta(days=1)
+    res = []
+    for a, b in intervals(slots, OFF):
+        res.append((_at(t, a), _at(t, b) if b < len(slots) * 30 else None))
+    return res
+
+
+def next_off_after(fact: dict, groups: list[str], moment: datetime) -> datetime | None:
+    """Найближчий початок відключення після moment для будь-якої з черг."""
+    starts = [a for g in groups for a, _ in off_intervals(fact, g, moment) if a > moment]
+    return min(starts) if starts else None
+
+
+def fmt_when(dt: datetime, now: datetime) -> str:
+    """«о 14:30», «завтра о 06:00», «25.10 о 06:00»."""
+    dt, now = dt.astimezone(KYIV), now.astimezone(KYIV)
+    delta = (dt.date() - now.date()).days
+    hm = dt.strftime("%H:%M")
+    if delta == 0:
+        return f"о {hm}"
+    if delta == 1:
+        return f"завтра о {hm}"
+    return f"{dt.strftime('%d.%m')} о {hm}"
