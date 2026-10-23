@@ -324,7 +324,10 @@ def chunks(items, n):
     return [items[i:i + n] for i in range(0, len(items), n)]
 
 
+# Під графіком: «Оновити» завжди надсилає НОВЕ повідомлення — графіки в чаті ніколи не перезаписуються.
 REFRESH_KB = kb([[("🔄 Оновити", "now")]])
+# Під службовими вікнами (статистика, люди, налаштування, довідка): перетворити вікно на графік або прибрати.
+BACK_BTN = ("⬅️ Назад", "back:")
 
 # ---------- тексти ----------
 COMMANDS_TEXT = (
@@ -386,6 +389,7 @@ def settings_view(sub: dict) -> tuple[str, InlineKeyboardMarkup]:
         lines.append("🔴 Відключення й аварійні роботи за адресою: "
                      "<i>доступно, якщо вказати адресу з номером будинку (/start)</i>")
     lines += ["", "<i>Зміни графіка я надсилаю завжди.</i>"]
+    rows.append([BACK_BTN])
     return "\n".join(lines), kb(rows)
 
 
@@ -492,14 +496,27 @@ async def current_outage_line(sub: dict, fact: dict | None = None) -> str:
     return line
 
 
-async def send_schedule(bot, chat_id, sub: dict, header: str = "⚡️ <b>Графік відключень</b>",
-                        fact: dict | None = None):
+async def schedule_text(sub: dict, header: str = "⚡️ <b>Графік відключень</b>", fact: dict | None = None) -> str:
     if fact is None:
         fact = await get_fact(sub["region"])
     extra = await current_outage_line(sub, fact)
-    text = format_schedule(fact, sub["groups"], sub.get("label", ""), dtek.site(sub["region"]).names,
+    return format_schedule(fact, sub["groups"], sub.get("label", ""), dtek.site(sub["region"]).names,
                            header=header, extra=extra)
+
+
+async def send_schedule(bot, chat_id, sub: dict, header: str = "⚡️ <b>Графік відключень</b>",
+                        fact: dict | None = None):
+    text = await schedule_text(sub, header, fact)
     await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, reply_markup=REFRESH_KB)
+
+
+async def safe_edit(q, text: str, markup=None):
+    """Змінити службове вікно; «message is not modified» (натиснули те саме) — не помилка."""
+    try:
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except Exception as e:  # noqa: BLE001
+        if "not modified" not in str(e).lower():
+            raise
 
 
 async def save_and_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE, groups: list[str], **addr):
@@ -582,7 +599,7 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await allowed(update):
         return
-    await update.effective_chat.send_message(HELP_TEXT, parse_mode=ParseMode.HTML)
+    await update.effective_chat.send_message(HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=kb([[BACK_BTN]]))
 
 
 def _fmt_ago(ts: float) -> str:
@@ -668,8 +685,10 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.effective_chat.send_message("Ця команда доступна лише адміністраторам бота.")
         return
     stats.touch(user)
-    await update.effective_chat.send_message(stats_text(), parse_mode=ParseMode.HTML,
-                                             reply_markup=kb([[("👥 Люди та їхні адреси", "adm:users")]]))
+    await update.effective_chat.send_message(stats_text(), parse_mode=ParseMode.HTML, reply_markup=STATS_KB)
+
+
+STATS_KB = kb([[("👥 Люди та їхні адреси", "adm:users:0")], [BACK_BTN]])
 
 
 def users_text() -> list[str]:
@@ -726,6 +745,19 @@ def users_text() -> list[str]:
     return pages
 
 
+def users_view(page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Одне вікно зі сторінками замість кількох повідомлень."""
+    pages = users_text()
+    page = max(0, min(page, len(pages) - 1))
+    nav = []
+    if len(pages) > 1:
+        nav = [("◀️", f"adm:users:{page - 1}") if page > 0 else ("·", "noop:"),
+               (f"{page + 1} / {len(pages)}", "noop:"),
+               ("▶️", f"adm:users:{page + 1}") if page < len(pages) - 1 else ("·", "noop:")]
+    rows = ([nav] if nav else []) + [[("📊 Статистика", "adm:stats")], [BACK_BTN]]
+    return pages[page], kb(rows)
+
+
 async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user or not is_admin(user.id, user.username):
@@ -733,8 +765,8 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.effective_chat.send_message("Ця команда доступна лише адміністраторам бота.")
         return
     stats.touch(user)
-    for page in users_text():
-        await update.effective_chat.send_message(page, parse_mode=ParseMode.HTML)
+    text, markup = users_view(0)
+    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=markup)
 
 
 # ---------- кнопки ----------
@@ -750,8 +782,38 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await cmd_now(update, ctx)
         return
 
-    if kind == "adm" and val == "users":
-        await cmd_users(update, ctx)
+    if kind == "noop":
+        return
+
+    if kind == "back":
+        # службове вікно -> актуальний графік (а без адреси просто прибираємо вікно)
+        sub = store.get(update.effective_chat.id)
+        if sub:
+            try:
+                text = await schedule_text(sub)
+            except DtekError:
+                cached = _fact_cache.get(sub["region"])
+                text = await schedule_text(sub, fact=cached[1]) if cached else None
+            if text:
+                await safe_edit(q, text, REFRESH_KB)
+                return
+        try:
+            await q.delete_message()
+        except Exception:  # noqa: BLE001 — старі (понад 48 год) повідомлення Telegram видаляти не дає
+            await safe_edit(q, "Щоб побачити графік — /now, налаштувати адресу — /start")
+        return
+
+    if kind == "adm":
+        user = update.effective_user
+        if not user or not is_admin(user.id, user.username):
+            await q.edit_message_text("Ця команда доступна лише адміністраторам бота.")
+            return
+        what, _, arg = val.partition(":")
+        if what == "stats":
+            await safe_edit(q, stats_text(), STATS_KB)
+        elif what == "users":
+            text, markup = users_view(int(arg) if arg.lstrip("-").isdigit() else 0)
+            await safe_edit(q, text, markup)
         return
 
     if kind == "set":
