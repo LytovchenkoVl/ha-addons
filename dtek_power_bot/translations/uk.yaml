@@ -1,0 +1,16 @@
+configuration:
+  telegram_token:
+    name: Токен Telegram-бота
+    description: Отримайте в @BotFather командою /newbot
+  poll_minutes:
+    name: Перевіряти кожні (хв)
+    description: Як часто бот звіряє графік із сайтом ДТЕК
+  allow_all:
+    name: Доступ для всіх
+    description: Увімкнено — ботом може користуватися будь-хто. Вимкнено — лише люди зі списку нижче
+  allowed_users:
+    name: Дозволені користувачі
+    description: Telegram ID (числом) або @username, по одному в рядку. Діє, коли «Доступ для всіх» вимкнено
+  deny_message:
+    name: Відповідь для сторонніх
+    description: Що бот напише людині без доступу. Свій Telegram ID вона побачить під цим текстом
