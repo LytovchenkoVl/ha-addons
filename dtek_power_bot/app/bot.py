@@ -141,6 +141,34 @@ def chunks(items, n):
 
 REFRESH_KB = kb([[("🔄 Оновити", "now")]])
 
+# ---------- тексти ----------
+COMMANDS_TEXT = (
+    "<b>Команди</b>\n"
+    "/now — графік на сьогодні й завтра\n"
+    "/start — вказати або змінити адресу чи чергу\n"
+    "/stop — вимкнути сповіщення\n"
+    "/help — що вміє бот"
+)
+
+WELCOME_TEXT = (
+    "👋 <b>Вітаю!</b>\n\n"
+    "Я стежу за графіками відключень на сайті ДТЕК і пишу, щойно ДТЕК змінює графік вашої черги "
+    "або публікує графік на завтра.\n\n"
+    f"{COMMANDS_TEXT}\n\n"
+    "Щоб почати, оберіть регіон:"
+)
+
+HELP_TEXT = (
+    "⚡️ <b>Що я вмію</b>\n"
+    "• Пишу, щойно ДТЕК змінює графік вашої черги або публікує графік на завтра. "
+    "Якщо змін немає — мовчу, опівночі не турбую.\n"
+    "• У кожному повідомленні: графік на сьогодні, чи є світло зараз, коли наступна зміна, і графік на завтра.\n"
+    "• Якщо ви вказали адресу — попереджаю про аварійні чи планові роботи на будинку, яких немає в графіку черг.\n"
+    "• Якщо будинок у двох чергах — показую обидві.\n\n"
+    f"{COMMANDS_TEXT}\n\n"
+    "Під кожним графіком є кнопка «🔄 Оновити»."
+)
+
 
 # ---------- доступ ----------
 def is_allowed(user_id: int | None, username: str | None) -> bool:
@@ -234,9 +262,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         text = (f"Я стежу за: {what}.\nСповіщення увімкнено, графік зараз — /now.\n\n"
                 "Щоб змінити адресу, оберіть регіон:")
     else:
-        text = ("Привіт! Я стежу за графіками відключень на сайті ДТЕК і пишу, щойно вони змінюються.\n\n"
-                "Оберіть регіон:")
-    await update.effective_chat.send_message(text, reply_markup=kb(rows))
+        text = WELCOME_TEXT
+    await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=kb(rows))
 
 
 async def cmd_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -260,8 +287,9 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.effective_chat.send_message(
-        "/start — вказати адресу або чергу\n/now — графік на сьогодні й завтра\n/stop — вимкнути сповіщення")
+    if not await allowed(update):
+        return
+    await update.effective_chat.send_message(HELP_TEXT, parse_mode=ParseMode.HTML)
 
 
 # ---------- кнопки ----------
@@ -462,9 +490,11 @@ async def post_init(app: Application):
     await dtek.start()
     await app.bot.set_my_commands([
         BotCommand("now", "Графік на сьогодні й завтра"),
-        BotCommand("start", "Вказати адресу або чергу"),
+        BotCommand("start", "Вказати або змінити адресу чи чергу"),
         BotCommand("stop", "Вимкнути сповіщення"),
+        BotCommand("help", "Що вміє бот"),
     ])
+    # опис бота (порожній чат і профіль) задається вручну в @BotFather: /setdescription, /setabouttext
     app.job_queue.run_repeating(poll, interval=POLL_MINUTES * 60, first=15)
     log.info("Бот запущено. Перевірка кожні %d хв, підписок: %d", POLL_MINUTES, len(store.data))
 
