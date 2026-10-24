@@ -31,6 +31,7 @@ REGIONS = {
 PAGE_MAX_AGE = 30 * 60
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+NO_ANIMATIONS_CSS = "*, *::before, *::after { animation: none !important; transition: none !important; }"
 
 # Той самий запит, що робить jQuery на сторінці ($.post('/ua/ajax', ...))
 AJAX_JS = """
@@ -84,6 +85,8 @@ class DtekSite:
             "() => typeof DisconSchedule !== 'undefined' && DisconSchedule.fact && DisconSchedule.streets",
             timeout=90_000,
         )
+        # сторінка має нескінченні CSS-анімації: headless Chromium малює їх безперервно (~70 % CPU на сервері)
+        await self.page.add_style_tag(content=NO_ANIMATIONS_CSS)
         info = await self.page.evaluate(
             "() => ({streets: DisconSchedule.streets, names: (DisconSchedule.preset||{}).sch_names || {}})"
         )

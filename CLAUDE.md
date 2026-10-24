@@ -14,6 +14,9 @@
   - `method=checkDisconUpdate&update=01.01.2000 00:00` → `{fact, preset}` для всіх черг;
   - `method=getHomeNum` + `data[i][name|value]` для `city`, `street`, `updateFact` → будинки
     `{номер: {sub_type_reason: ["GPV5.1"], sub_type, start_date, end_date}}`.
+  Сторінка ДТЕК має нескінченні CSS-анімації: без `NO_ANIMATIONS_CSS` headless Chromium малює їх постійно
+  (~14 % ядра на ПК, ~74 % CPU на K55D). Стиль додається в `DtekSite._load()` — не прибирати.
+  Версія без цього (1.10.0) збережена в гілці `backup/1.10.0-animations` і тегом `v1.10.0`.
 - `app/schedule.py` — розбір `fact`: `data[<unix ts півночі за Києвом>][GPVx.y][1..24]` зі станами
   `yes/no/first/second/maybe/mfirst/msecond`; `fact.update` — коли ДТЕК змінив графік.
   `updateTimestamp`, який сайт показує біля адреси, оновлюється постійно — для визначення змін не використовувати.
