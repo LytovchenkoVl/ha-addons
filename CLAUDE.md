@@ -6,6 +6,8 @@
 
 ## dtek_power_bot — Telegram-бот графіків відключень ДТЕК
 
+- **Дані лише з сайтів ДТЕК** (вимога користувача). Бот не має доступу до Home Assistant: у `config.yaml` немає
+  `homeassistant_api`/`hassio_api`, код не читає сутностей, датчиків чи перемикачів HA. Не додавати без прохання.
 - `app/bot.py` — Telegram (python-telegram-bot 21–22, job-queue): `/start` (регіон → адреса або черга), `/now`, `/stop`,
   опитування сайту кожні `poll_minutes`, підписки в `/data/subscriptions.json` (по одній на чат).
 - `app/dtek.py` — Playwright Chromium відкриває `https://www.dtek-<krem|kem|dnem|oem>.com.ua/ua/shutdowns`
