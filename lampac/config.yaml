@@ -1,5 +1,5 @@
 name: "Lampac"
-version: "1.90.0"
+version: "1.90.0-2"
 slug: lampac
 description: "Lampac NextGen — сервер для Лампи: онлайн-джерела, синхронізація, плагіни"
 url: "https://github.com/lampac-nextgen/lampac"
@@ -15,3 +15,4 @@ ports_description:
   9118/tcp: "Lampac (адреса для Лампи)"
 map:
   - addon_config:rw
+  - share:rw

@@ -1,0 +1,1 @@
+Lampa.Player.playlist((function(){var l=[];data.forEach(function(el){var x=(el.path||'').split('.').pop().toLowerCase();if(el.type=='file'&&media_formats.indexOf(x)>=0)l.push(el.uri==element.uri?video:{title:escapeHtml(el.name),url:account(el.uri),timeline:Lampa.Timeline.view(Lampa.Utils.hash(el.name))});});return l.length?l:[video];})());
