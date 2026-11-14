@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sys
 import asyncio
 import time
 from datetime import datetime, timedelta
@@ -18,7 +19,6 @@ from telegram.error import Forbidden
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
-import ha
 from dtek import REGIONS, Dtek, DtekError
 from schedule import (KYIV, fmt_when, format_schedule, group_label, has_changed, next_off_after, off_intervals,
                       signature, today_kyiv)
@@ -49,8 +49,8 @@ ADMIN_IDS, ADMIN_NAMES = parse_people(opts.get("admin_users") or os.environ.get(
 ALLOW_ALL = bool(opts["allow_all"]) if "allow_all" in opts else not (ALLOWED_IDS or ALLOWED_NAMES)
 DENY_MESSAGE = (opts.get("deny_message") or "").strip() or "Це приватний бот, доступ мають лише окремі люди."
 STARTED_AT = time.time()
-# «Технічні роботи»: перемикач — сутність Home Assistant (input_boolean, бот лише читає), тексти — в налаштуваннях
-MAINT_SWITCH = (opts.get("maintenance_switch") or "").strip()
+# «Технічні роботи»: перемикач і тексти — у налаштуваннях аддона; автоматизації перемикають через stdin
+MAINT_OPT = bool(opts.get("maintenance", False))
 def _maint_opt(key: str) -> str:
     v = (opts.get(key) or "").strip()
     return "" if v.startswith("input_text.") else v  # у 1.12.0 тут були назви сутностей HA
@@ -1324,25 +1324,42 @@ async def broadcast(bot, text: str):
     return sent
 
 
-async def maint_check(ctx: ContextTypes.DEFAULT_TYPE):
-    """Стежить за перемикачем «Технічні роботи» в HA; на вмикання/вимикання розсилає тексти."""
-    state = await ha.get_state(MAINT_SWITCH)
-    if state not in ("on", "off"):
-        return  # HA недоступний або сутності немає — нічого не міняємо
-    on = state == "on"
+async def set_maint(bot, on: bool, why: str):
+    """Увімкнути/вимкнути «Технічні роботи»; при зміні — розіслати відповідний текст усім."""
     maint["on"] = on
-    prev = stats.data.get("maint_on")
-    if prev is None or prev == on:
-        if prev is None:  # перший запуск з цією функцією — лише запам'ятати стан
-            stats.data["maint_on"] = on
-            stats.dirty = True
-            stats.save()
+    if bool(stats.data.get("maint_on")) == on:
         return
     stats.data["maint_on"] = on
     stats.dirty = True
     stats.save()
-    n = await broadcast(ctx.bot, MAINT_TEXT if on else MAINT_END_TEXT)
-    log.info("технічні роботи %s — розіслано %d повідомлень", "увімкнено" if on else "вимкнено", n)
+    n = await broadcast(bot, MAINT_TEXT if on else MAINT_END_TEXT)
+    log.info("технічні роботи %s (%s) — розіслано %d повідомлень", "увімкнено" if on else "вимкнено", why, n)
+
+
+async def apply_maint_option(ctx: ContextTypes.DEFAULT_TYPE):
+    """Перемикач у налаштуваннях аддона діє, лише коли його змінили (інакше лишається стан, заданий через stdin)."""
+    if stats.data.get("maint_opt") != MAINT_OPT:
+        stats.data["maint_opt"] = MAINT_OPT
+        await set_maint(ctx.bot, MAINT_OPT, "налаштування аддона")
+    else:
+        maint["on"] = bool(stats.data.get("maint_on"))
+
+
+STDIN_COMMANDS = {"maintenance_on": True, "on": True, "maintenance_off": False, "off": False}
+
+
+async def read_stdin(bot):
+    """Команди з автоматизацій HA: служба hassio.addon_stdin з input «maintenance_on» / «maintenance_off»."""
+    loop = asyncio.get_running_loop()
+    while True:
+        line = await loop.run_in_executor(None, sys.stdin.readline)
+        if not line:
+            return  # stdin закрито
+        cmd = line.strip().strip('"').lower()
+        if cmd in STDIN_COMMANDS:
+            await set_maint(bot, STDIN_COMMANDS[cmd], "автоматизація")
+        elif cmd:
+            log.info("невідома команда stdin: %s", cmd)
 
 
 def _place(sub: dict, groups: list[str]) -> str:
@@ -1483,8 +1500,8 @@ async def post_init(app: Application):
     # опис бота (порожній чат і профіль) задається вручну в @BotFather: /setdescription, /setabouttext
     app.job_queue.run_repeating(poll, interval=POLL_MINUTES * 60, first=15)
     app.job_queue.run_repeating(remind, interval=60, first=40)
-    if MAINT_SWITCH:
-        app.job_queue.run_repeating(maint_check, interval=20, first=5)
+    app.job_queue.run_once(apply_maint_option, when=5)
+    asyncio.get_running_loop().create_task(read_stdin(app.bot))
     stats.started(store.data)
     log.info("Бот запущено. Перевірка кожні %d хв, підписок: %d, людей у статистиці: %d (файл %s)",
              POLL_MINUTES, len(store.data), len(stats.data["users"]), stats.path)
