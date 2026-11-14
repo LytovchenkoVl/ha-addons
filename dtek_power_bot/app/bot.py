@@ -425,15 +425,18 @@ def admin_chat_ids() -> set[int]:
     return ids
 
 
-async def ensure_keyboard(chat, user):
-    """Особистий чат має клавіші, що відповідають ролі: звичайні або з «Статистика»/«Люди» для адміністратора."""
+async def ensure_keyboard(chat, user, force: bool = False):
+    """Особистий чат має клавіші, що відповідають ролі: звичайні або з «Статистика»/«Люди» для адміністратора.
+    force — надіслати знову (клавіші могли зникнути: очищена історія, інший пристрій)."""
     if not chat or not user or getattr(chat, "type", "private") != "private":
         return
     want = "admin" if is_admin(user.id, user.username) else "user"
     have = stats.data["kb"].get(str(chat.id))
-    if have == want:
+    if have == want and not force:
         return
-    if want == "admin":
+    if force:
+        text = "⌨️ Клавіші внизу повернуто."
+    elif want == "admin":
         text = f"👑 Ви адміністратор бота — внизу є клавіші «{KEY_STATS}» і «{KEY_USERS}»."
     elif have == "admin":
         text = "Клавіші оновлено."
@@ -621,6 +624,10 @@ async def save_and_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE, groups: 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await allowed(update):
         return
+    if (update.message and (update.message.text or "").startswith("/start")
+            and stats.data["kb"].get(str(update.effective_chat.id))):
+        # /start вручну — найчастіше тому, що клавіші внизу зникли
+        await ensure_keyboard(update.effective_chat, update.effective_user, force=True)
     ctx.user_data.clear()
     rows = [[(r["name"], f"r:{k}")] for k, r in REGIONS.items()]
     sub = store.get(update.effective_chat.id)
@@ -1165,7 +1172,11 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     step = ud.get("step")
     text = (update.message.text or "").strip()
     if not step or "region" not in ud:
-        await update.effective_chat.send_message("Графік — «📊 Графік», адреса чи черга — «📍 Адреса» (клавіші внизу)")
+        user = update.effective_user
+        await update.effective_chat.send_message(
+            "Графік — «📊 Графік», адреса чи черга — «📍 Адреса» (клавіші внизу)",
+            reply_markup=reply_keys(is_admin(user.id, user.username))
+            if user and update.effective_chat.type == "private" else None)
         return
     site = dtek.site(ud["region"])
 
