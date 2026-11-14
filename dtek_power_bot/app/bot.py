@@ -12,6 +12,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import httpx
 from telegram import (BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, BotCommandScopeChat,
                       InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update)
 from telegram.constants import ParseMode
@@ -54,14 +55,18 @@ ALLOW_ALL = bool(opts["allow_all"]) if "allow_all" in opts else not (ALLOWED_IDS
 DENY_MESSAGE = (opts.get("deny_message") or "").strip() or "Це приватний бот, доступ мають лише окремі люди."
 STARTED_AT = time.time()
 # «Технічні роботи»: перемикач і тексти — у налаштуваннях аддона; автоматизації перемикають через stdin
-MAINT_OPT = bool(opts.get("maintenance", False))
+SUPERVISOR_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
+
+
 def _maint_opt(key: str) -> str:
     v = (opts.get(key) or "").strip()
     return "" if v.startswith("input_text.") else v  # у 1.12.0 тут були назви сутностей HA
 
 
-MAINT_TEXT = _maint_opt("maintenance_text") or "🛠 Технічні роботи. Бот тимчасово може працювати з перебоями."
-MAINT_END_TEXT = _maint_opt("maintenance_end_text") or "✅ Технічні роботи завершено, бот працює як звичайно."
+MAINT_DEFAULT = "🛠 Технічні роботи. Бот тимчасово може працювати з перебоями."
+MAINT_END_DEFAULT = "✅ Технічні роботи завершено, бот працює як звичайно."
+MAINT_TEXT = _maint_opt("maintenance_text") or MAINT_DEFAULT
+MAINT_END_TEXT = _maint_opt("maintenance_end_text") or MAINT_END_DEFAULT
 maint = {"on": False}
 
 dtek = Dtek()
@@ -1366,11 +1371,34 @@ async def set_maint(bot, on: bool, why: str):
     log.info("технічні роботи %s (%s) — розіслано %d повідомлень", "увімкнено" if on else "вимкнено", why, n)
 
 
+async def live_options() -> dict | None:
+    """Поточні налаштування аддона від Supervisor — щойно збережені, без перезапуску бота."""
+    if not SUPERVISOR_TOKEN:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get("http://supervisor/addons/self/info",
+                                 headers={"Authorization": f"Bearer {SUPERVISOR_TOKEN}"})
+        r.raise_for_status()
+        return r.json()["data"]["options"]
+    except Exception as e:  # noqa: BLE001
+        log.warning("не вдалося прочитати налаштування аддона: %s", e)
+        return None
+
+
 async def apply_maint_option(ctx: ContextTypes.DEFAULT_TYPE):
-    """Перемикач у налаштуваннях аддона діє, лише коли його змінили (інакше лишається стан, заданий через stdin)."""
-    if stats.data.get("maint_opt") != MAINT_OPT:
-        stats.data["maint_opt"] = MAINT_OPT
-        await set_maint(ctx.bot, MAINT_OPT, "налаштування аддона")
+    """Кожні 20 с: тексти й перемикач з налаштувань аддона. Перемикач діє, лише коли його змінили
+    (інакше лишається стан, заданий через stdin)."""
+    global MAINT_TEXT, MAINT_END_TEXT
+    live = await live_options()
+    if live is not None:
+        opts.update(live)
+    MAINT_TEXT = _maint_opt("maintenance_text") or MAINT_DEFAULT
+    MAINT_END_TEXT = _maint_opt("maintenance_end_text") or MAINT_END_DEFAULT
+    want = bool(opts.get("maintenance", False))
+    if stats.data.get("maint_opt") != want:
+        stats.data["maint_opt"] = want
+        await set_maint(ctx.bot, want, "налаштування аддона")
     else:
         maint["on"] = bool(stats.data.get("maint_on"))
 
@@ -1530,7 +1558,7 @@ async def post_init(app: Application):
     # опис бота (порожній чат і профіль) задається вручну в @BotFather: /setdescription, /setabouttext
     app.job_queue.run_repeating(poll, interval=POLL_MINUTES * 60, first=15)
     app.job_queue.run_repeating(remind, interval=60, first=40)
-    app.job_queue.run_once(apply_maint_option, when=5)
+    app.job_queue.run_repeating(apply_maint_option, interval=20, first=5)
     asyncio.get_running_loop().create_task(read_stdin(app.bot))
     stats.started(store.data)
     log.info("Бот запущено. Перевірка кожні %d хв, підписок: %d, людей у статистиці: %d (файл %s)",

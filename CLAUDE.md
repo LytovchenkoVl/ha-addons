@@ -10,6 +10,8 @@
 - «Технічні роботи» (1.14.0): перемикач `maintenance` і тексти `maintenance_text` / `maintenance_end_text` — опції аддона
   (користувач не хоче сутностей HA). Опція діє на старті, лише якщо змінилась (`stats.data['maint_opt']`). Автоматизації HA
   перемикають через `stdin: true`: служба `hassio.addon_stdin`, input `maintenance_on` / `maintenance_off` (`read_stdin`).
+  З 1.16.0 опції (перемикач і тексти) читаються наживо кожні 20 с з `GET http://supervisor/addons/self/info`
+  (`hassio_api: true`, `live_options()`), тож збереження в UI діє без перезапуску.
   Зміна стану (`set_maint`, `stats.data['maint_on']`) → `broadcast()` тексту всім активним підпискам і адмінам (навіть без підписки); поки увімкнено —
   у `allowed()` усім, крім адмінів, бот відповідає лише текстом робіт. Сповіщення про графік працюють далі.
 - **Швидке оновлення без збірки** (`start.sh`): код із `/config/app` (= `/app_configs/cbbecad4_dtek_power_bot/app` на HA)
