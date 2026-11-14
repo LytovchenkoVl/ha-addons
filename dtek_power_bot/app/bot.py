@@ -10,7 +10,8 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from telegram import BotCommand, BotCommandScopeChat, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (BotCommand, BotCommandScopeAllGroupChats, BotCommandScopeAllPrivateChats, BotCommandScopeChat,
+                      InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update)
 from telegram.constants import ParseMode
 from telegram.error import Forbidden
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
@@ -89,7 +90,7 @@ class Stats:
             self.data = json.loads(path.read_text())
         except (FileNotFoundError, json.JSONDecodeError):
             self.data = {}
-        for k in ("users", "sent", "denied", "polls"):
+        for k in ("users", "sent", "denied", "polls", "kb"):
             self.data.setdefault(k, {})
         self.dirty = False
         if "since" not in self.data:  # коли почали вести статистику — видно, якщо дані колись зникнуть
@@ -329,14 +330,25 @@ REFRESH_KB = kb([[("🔄 Оновити", "now")]])
 # Під службовими вікнами (статистика, люди, налаштування, довідка): перетворити вікно на графік або прибрати.
 BACK_BTN = ("⬅️ Назад", "back:")
 
+# ---------- клавіші внизу чату (замість кнопки «Меню» в особистих чатах) ----------
+KEY_NOW, KEY_ADDR, KEY_SETTINGS, KEY_HELP = "📊 Графік", "📍 Адреса", "⚙️ Налаштування", "❓ Допомога"
+KEY_STATS, KEY_USERS = "📈 Статистика", "👥 Люди"
+USER_KEYS = [[KEY_NOW, KEY_ADDR], [KEY_SETTINGS, KEY_HELP]]
+ADMIN_KEYS = USER_KEYS + [[KEY_STATS, KEY_USERS]]
+
+
+def reply_keys(admin: bool) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(ADMIN_KEYS if admin else USER_KEYS, resize_keyboard=True, is_persistent=True)
+
+
 # ---------- тексти ----------
 COMMANDS_TEXT = (
-    "<b>Команди</b>\n"
-    "/now — графік на сьогодні й завтра\n"
-    "/start — вказати або змінити адресу чи чергу\n"
-    "/settings — нагадування й сповіщення\n"
-    "/stop — вимкнути сповіщення\n"
-    "/help — що вміє бот"
+    "<b>Клавіші внизу</b>\n"
+    f"{KEY_NOW} — графік на сьогодні й завтра\n"
+    f"{KEY_ADDR} — вказати або змінити адресу чи чергу\n"
+    f"{KEY_SETTINGS} — нагадування й сповіщення\n"
+    f"{KEY_HELP} — що вміє бот\n"
+    "Вимкнути всі сповіщення — /stop"
 )
 
 WELCOME_TEXT = (
@@ -356,7 +368,7 @@ HELP_TEXT = (
     "• Якщо ви вказали адресу — пишу, коли на будинку фактично вимкнули світло (буває на пів години раніше "
     "чи пізніше за графік), а також про аварійні чи планові роботи: початок, зміну часу й завершення.\n"
     "• Якщо будинок у двох чергах — показую обидві.\n"
-    "• Що саме надсилати — у /settings.\n\n"
+    "• Що саме надсилати — у «⚙️ Налаштування».\n\n"
     f"{COMMANDS_TEXT}\n\n"
     "Під кожним графіком є кнопка «🔄 Оновити».\n\n"
     "<i>Вказана адреса зберігається на сервері власника бота і видна йому. "
@@ -387,7 +399,7 @@ def settings_view(sub: dict) -> tuple[str, InlineKeyboardMarkup]:
         rows.append([(("Не писати" if p["emergency"] else "Писати") + " про відключення за адресою", "set:emergency")])
     else:
         lines.append("🔴 Відключення й аварійні роботи за адресою: "
-                     "<i>доступно, якщо вказати адресу з номером будинку (/start)</i>")
+                     "<i>доступно, якщо вказати адресу з номером будинку («📍 Адреса»)</i>")
     lines += ["", "<i>Зміни графіка я надсилаю завжди.</i>"]
     rows.append([BACK_BTN])
     return "\n".join(lines), kb(rows)
@@ -404,10 +416,66 @@ def is_allowed(user_id: int | None, username: str | None) -> bool:
     return (user_id in ALLOWED_IDS) or bool(username and username.lower() in ALLOWED_NAMES)
 
 
+def admin_chat_ids() -> set[int]:
+    """Адміністратори, яким бот може писати: за ID, а за @username — якщо людина вже писала боту."""
+    ids = set(ADMIN_IDS)
+    for uid, u in stats.data["users"].items():
+        if (u.get("username") or "").lower() in ADMIN_NAMES:
+            ids.add(int(uid))
+    return ids
+
+
+async def ensure_keyboard(chat, user):
+    """Особистий чат має клавіші, що відповідають ролі: звичайні або з «Статистика»/«Люди» для адміністратора."""
+    if not chat or not user or getattr(chat, "type", "private") != "private":
+        return
+    want = "admin" if is_admin(user.id, user.username) else "user"
+    have = stats.data["kb"].get(str(chat.id))
+    if have == want:
+        return
+    if want == "admin":
+        text = f"👑 Ви адміністратор бота — внизу є клавіші «{KEY_STATS}» і «{KEY_USERS}»."
+    elif have == "admin":
+        text = "Клавіші оновлено."
+    else:
+        text = "⌨️ Внизу — клавіші для швидкого доступу."
+    await chat.send_message(text, reply_markup=reply_keys(want == "admin"))
+    stats.data["kb"][str(chat.id)] = want
+    stats.dirty = True
+    stats.save()
+
+
+async def sync_admin_keyboards(bot):
+    """На старті: новим адміністраторам — клавіші зі статистикою, колишнім — звичайні."""
+    admins = admin_chat_ids()
+    kb_state = stats.data["kb"]
+    for cid in admins:
+        if kb_state.get(str(cid)) == "admin":
+            continue
+        try:
+            await bot.send_message(cid, f"👑 Вас додано до адміністраторів бота — внизу з'явилися клавіші "
+                                        f"«{KEY_STATS}» і «{KEY_USERS}».", reply_markup=reply_keys(True))
+            kb_state[str(cid)] = "admin"
+            log.info("адміністратору %s надіслано клавіші", cid)
+        except Exception as e:  # noqa: BLE001 — людина ще не писала боту: клавіші з'являться при першому повідомленні
+            log.info("клавіші адміністратора для %s поки не надіслано: %s", cid, e)
+    for cid, state in list(kb_state.items()):
+        if state == "admin" and int(cid) not in admins:
+            try:
+                await bot.send_message(int(cid), "Клавіші оновлено.", reply_markup=reply_keys(False),
+                                       disable_notification=True)
+            except Exception as e:  # noqa: BLE001
+                log.info("не вдалося оновити клавіші для %s: %s", cid, e)
+            kb_state[cid] = "user"
+    stats.dirty = True
+    stats.save()
+
+
 async def allowed(update: Update) -> bool:
     user = update.effective_user
     if user and is_allowed(user.id, user.username):
         stats.touch(user)
+        await ensure_keyboard(update.effective_chat, user)
         # людина знову пише боту (наприклад, після зміни токена) — відновлюємо сповіщення
         sub = store.get(update.effective_chat.id) if update.effective_chat else None
         if sub and sub.get("paused"):
@@ -524,7 +592,7 @@ async def save_and_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE, groups: 
     try:
         fact = await get_fact(region, max_age=0)
     except DtekError:
-        await update.effective_chat.send_message("Не вдалося отримати графік із сайту ДТЕК. Спробуйте /now трохи згодом.")
+        await update.effective_chat.send_message("Не вдалося отримати графік із сайту ДТЕК. Спробуйте «📊 Графік» трохи згодом.")
         fact = {}
     user = update.effective_user
     old = store.get(update.effective_chat.id) or {}
@@ -543,7 +611,7 @@ async def save_and_show(update: Update, ctx: ContextTypes.DEFAULT_TYPE, groups: 
         "або опублікує графік на завтра."
         + (f" Перед кожним відключенням нагадаю за {p['before']} хв." if p["before"] else "")
         + (" Також напишу, коли на будинку вимкнуть світло, і про аварійні роботи." if sub.get("house") and p["emergency"] else "")
-        + "\n/now — графік зараз, /settings — нагадування, /start — змінити адресу, /stop — відписатися."
+        + "\nГрафік, нагадування й зміна адреси — клавішами внизу, вимкнути сповіщення — /stop."
     )
     if fact:
         await send_schedule(ctx.bot, update.effective_chat.id, sub, fact=fact)
@@ -558,7 +626,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sub = store.get(update.effective_chat.id)
     if sub:
         what = sub.get("label") or ", ".join(group_label(g, dtek.site(sub["region"]).names) for g in sub["groups"])
-        text = (f"Я стежу за: {what}.\nСповіщення увімкнено, графік зараз — /now.\n\n"
+        text = (f"Я стежу за: {what}.\nСповіщення увімкнено, графік зараз — «📊 Графік».\n\n"
                 "Щоб змінити адресу, оберіть регіон:")
     else:
         text = WELCOME_TEXT
@@ -570,7 +638,7 @@ async def cmd_now(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     sub = store.get(update.effective_chat.id)
     if not sub:
-        await update.effective_chat.send_message("Спершу вкажіть адресу або чергу: /start")
+        await update.effective_chat.send_message("Спершу вкажіть адресу або чергу: «📍 Адреса»")
         return
     try:
         await send_schedule(ctx.bot, update.effective_chat.id, sub)
@@ -583,7 +651,7 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     sub = store.get(update.effective_chat.id)
     if not sub:
-        await update.effective_chat.send_message("Спершу вкажіть адресу або чергу: /start")
+        await update.effective_chat.send_message("Спершу вкажіть адресу або чергу: «📍 Адреса»")
         return
     text, markup = settings_view(sub)
     await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=markup)
@@ -593,7 +661,7 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await allowed(update):
         return
     store.delete(update.effective_chat.id)
-    await update.effective_chat.send_message("Сповіщення вимкнено. Щоб увімкнути знову — /start")
+    await update.effective_chat.send_message("Сповіщення вимкнено. Щоб увімкнути знову — «📍 Адреса»")
 
 
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -669,6 +737,21 @@ def stats_text() -> str:
         f"Перевірка сайту кожні {POLL_MINUTES} хв",
     ]
 
+    lines += ["", "👑 <b>Адміністратори</b>"]
+    known = set()
+    for cid in sorted(admin_chat_ids()):
+        u = stats.data["users"].get(str(cid)) or {}
+        known.add((u.get("username") or "").lower())
+        who = html.escape(u.get("name") or "Без імені")
+        if u.get("username"):
+            who += f" @{html.escape(u['username'])}"
+        seen = f"останній вхід {u['last'][8:10]}.{u['last'][5:7]}" if u.get("last") else "ще не писав боту"
+        lines.append(f"{who} — <code>{cid}</code>, {seen}")
+    for name in sorted(ADMIN_NAMES - known):
+        lines.append(f"@{html.escape(name)} — ще не писав боту")
+    if not ADMIN_IDS and not ADMIN_NAMES:
+        lines.append("<i>не вказано</i>")
+
     denied = list(stats.data["denied"].items())[-5:]
     if denied and not ALLOW_ALL:
         lines += ["", "⛔ <b>Просили доступ</b> (додайте ID у «Дозволені користувачі»)"]
@@ -684,7 +767,7 @@ async def cmd_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if await allowed(update):
             await update.effective_chat.send_message("Ця команда доступна лише адміністраторам бота.")
         return
-    stats.touch(user)
+    await allowed(update)
     await update.effective_chat.send_message(stats_text(), parse_mode=ParseMode.HTML, reply_markup=STATS_KB)
 
 
@@ -764,9 +847,17 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if await allowed(update):
             await update.effective_chat.send_message("Ця команда доступна лише адміністраторам бота.")
         return
-    stats.touch(user)
+    await allowed(update)
     text, markup = users_view(0)
     await update.effective_chat.send_message(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
+async def on_key(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Натискання клавіш унизу чату — те саме, що відповідні команди."""
+    handler = {KEY_NOW: cmd_now, KEY_ADDR: cmd_start, KEY_SETTINGS: cmd_settings, KEY_HELP: cmd_help,
+               KEY_STATS: cmd_stats, KEY_USERS: cmd_users}.get((update.message.text or "").strip())
+    if handler:
+        await handler(update, ctx)
 
 
 # ---------- кнопки ----------
@@ -800,7 +891,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         try:
             await q.delete_message()
         except Exception:  # noqa: BLE001 — старі (понад 48 год) повідомлення Telegram видаляти не дає
-            await safe_edit(q, "Щоб побачити графік — /now, налаштувати адресу — /start")
+            await safe_edit(q, "Графік — «📊 Графік», адреса — «📍 Адреса»")
         return
 
     if kind == "adm":
@@ -819,7 +910,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if kind == "set":
         sub = store.get(update.effective_chat.id)
         if not sub:
-            await q.edit_message_text("Спершу вкажіть адресу або чергу: /start")
+            await q.edit_message_text("Спершу вкажіть адресу або чергу: «📍 Адреса»")
             return
         p = sub.setdefault("prefs", {})
         what, _, arg = val.partition(":")
@@ -1074,7 +1165,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     step = ud.get("step")
     text = (update.message.text or "").strip()
     if not step or "region" not in ud:
-        await update.effective_chat.send_message("/now — графік зараз, /start — налаштувати адресу або чергу")
+        await update.effective_chat.send_message("Графік — «📊 Графік», адреса чи черга — «📍 Адреса» (клавіші внизу)")
         return
     site = dtek.site(ud["region"])
 
@@ -1300,22 +1391,26 @@ async def check_emergency(ctx: ContextTypes.DEFAULT_TYPE, region: str):
 
 async def post_init(app: Application):
     await dtek.start()
+    # В особистих чатах кнопку «Меню» замінюють клавіші внизу, тож меню команд лишаємо тільки для груп
+    # (команди, набрані вручну, працюють усюди).
     await app.bot.set_my_commands([
         BotCommand("now", "Графік на сьогодні й завтра"),
         BotCommand("start", "Вказати або змінити адресу чи чергу"),
         BotCommand("settings", "Нагадування та сповіщення"),
         BotCommand("stop", "Вимкнути сповіщення"),
         BotCommand("help", "Що вміє бот"),
-    ])
-    # адміністраторам (за числовим ID) — те саме меню плюс /stats
-    for admin_id in ADMIN_IDS:
-        try:
-            await app.bot.set_my_commands(
-                [*(await app.bot.get_my_commands()), BotCommand("stats", "Статистика бота"),
-                 BotCommand("users", "Люди та їхні адреси")],
-                scope=BotCommandScopeChat(admin_id))
-        except Exception as e:  # noqa: BLE001 — людина ще не писала боту
-            log.info("меню /stats для %s поки не встановлено: %s", admin_id, e)
+    ], scope=BotCommandScopeAllGroupChats())
+    await app.bot.delete_my_commands()
+    await app.bot.delete_my_commands(scope=BotCommandScopeAllPrivateChats())
+    # до версії 1.11 адміністраторам ставилось окреме меню з /stats — прибираємо його один раз
+    if not stats.data.get("menu_v2"):
+        for uid in {*map(str, ADMIN_IDS), *stats.data["users"]}:
+            try:
+                await app.bot.delete_my_commands(scope=BotCommandScopeChat(int(uid)))
+            except Exception:  # noqa: BLE001
+                pass
+        stats.data["menu_v2"] = True
+    await sync_admin_keyboards(app.bot)
     # опис бота (порожній чат і профіль) задається вручну в @BotFather: /setdescription, /setabouttext
     app.job_queue.run_repeating(poll, interval=POLL_MINUTES * 60, first=15)
     app.job_queue.run_repeating(remind, interval=60, first=40)
@@ -1340,6 +1435,8 @@ def main():
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(MessageHandler(filters.Text([KEY_NOW, KEY_ADDR, KEY_SETTINGS, KEY_HELP, KEY_STATS, KEY_USERS]),
+                                   on_key))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
