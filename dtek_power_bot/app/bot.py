@@ -1359,6 +1359,44 @@ async def broadcast(bot, text: str):
     return sent
 
 
+async def broadcast_end(bot) -> int:
+    """Кінець робіт: кожній підписці — текст завершення разом зі свіжим графіком з ДТЕК, адмінам без підписки — лише текст."""
+    facts = {}
+    for region in sorted({s["region"] for s in store.data.values()}):
+        try:
+            facts[region] = await get_fact(region, max_age=0)
+        except DtekError as e:
+            log.warning("[%s] кінець робіт: графік не взяти: %s", region, e)
+    header = f"<b>{html.escape(MAINT_END_TEXT)}</b>"
+    sent, done = 0, set()
+    for chat_id, sub in list(store.data.items()):
+        if sub.get("paused") or not is_allowed(sub.get("user_id"), sub.get("username")):
+            continue
+        fact = facts.get(sub["region"])
+        try:
+            if fact is None:
+                await bot.send_message(int(chat_id), MAINT_END_TEXT)
+            else:
+                await send_schedule(bot, int(chat_id), sub, header=header, fact=fact)
+                # графік щойно надіслано — щоб наступна перевірка не прислала його ще раз як «змінився»
+                sub["sig"], sub["update"] = signature(fact, sub["groups"]), fact.get("update")
+            sent += 1
+        except Forbidden:
+            sub["paused"] = True
+        except Exception as e:  # noqa: BLE001
+            log.warning("не вдалося надіслати в %s: %s", chat_id, e)
+        done.add(int(chat_id))
+        await asyncio.sleep(0.05)
+    for cid in admin_chat_ids() - done:
+        try:
+            await bot.send_message(cid, MAINT_END_TEXT)
+            sent += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("не вдалося надіслати в %s: %s", cid, e)
+    store.save()
+    return sent
+
+
 async def set_maint(bot, on: bool, why: str):
     """Увімкнути/вимкнути «Технічні роботи»; при зміні — розіслати відповідний текст усім."""
     maint["on"] = on
@@ -1367,7 +1405,7 @@ async def set_maint(bot, on: bool, why: str):
     stats.data["maint_on"] = on
     stats.dirty = True
     stats.save()
-    n = await broadcast(bot, MAINT_TEXT if on else MAINT_END_TEXT)
+    n = await broadcast(bot, MAINT_TEXT) if on else await broadcast_end(bot)
     log.info("технічні роботи %s (%s) — розіслано %d повідомлень", "увімкнено" if on else "вимкнено", why, n)
 
 
