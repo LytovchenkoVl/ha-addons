@@ -49,13 +49,16 @@ ADMIN_IDS, ADMIN_NAMES = parse_people(opts.get("admin_users") or os.environ.get(
 ALLOW_ALL = bool(opts["allow_all"]) if "allow_all" in opts else not (ALLOWED_IDS or ALLOWED_NAMES)
 DENY_MESSAGE = (opts.get("deny_message") or "").strip() or "Це приватний бот, доступ мають лише окремі люди."
 STARTED_AT = time.time()
-# «Технічні роботи»: перемикач і тексти — сутності Home Assistant (створює користувач, бот лише читає)
+# «Технічні роботи»: перемикач — сутність Home Assistant (input_boolean, бот лише читає), тексти — в налаштуваннях
 MAINT_SWITCH = (opts.get("maintenance_switch") or "").strip()
-MAINT_TEXT = (opts.get("maintenance_text") or "").strip()
-MAINT_END_TEXT = (opts.get("maintenance_end_text") or "").strip()
-MAINT_DEFAULT = "🛠 Технічні роботи. Бот тимчасово може працювати з перебоями."
-MAINT_END_DEFAULT = "✅ Технічні роботи завершено, бот працює як звичайно."
-maint = {"on": False, "text": MAINT_DEFAULT}
+def _maint_opt(key: str) -> str:
+    v = (opts.get(key) or "").strip()
+    return "" if v.startswith("input_text.") else v  # у 1.12.0 тут були назви сутностей HA
+
+
+MAINT_TEXT = _maint_opt("maintenance_text") or "🛠 Технічні роботи. Бот тимчасово може працювати з перебоями."
+MAINT_END_TEXT = _maint_opt("maintenance_end_text") or "✅ Технічні роботи завершено, бот працює як звичайно."
+maint = {"on": False}
 
 dtek = Dtek()
 
@@ -492,7 +495,7 @@ async def allowed(update: Update) -> bool:
             if update.callback_query:
                 await update.callback_query.answer("Технічні роботи")
             if update.effective_chat:
-                await update.effective_chat.send_message(maint["text"])
+                await update.effective_chat.send_message(MAINT_TEXT)
             return False
         await ensure_keyboard(update.effective_chat, user)
         # людина знову пише боту (наприклад, після зміни токена) — відновлюємо сповіщення
@@ -1303,11 +1306,6 @@ async def _send(ctx, chat_id, sub: dict, text: str, kind: str) -> bool:
     return False
 
 
-async def maint_text(entity: str, default: str) -> str:
-    text = (await ha.get_state(entity) or "").strip() if entity else ""
-    return default if text in ("", "unknown", "unavailable") else text
-
-
 async def broadcast(bot, text: str):
     """Одне повідомлення всім активним підпискам (без кнопок)."""
     sent = 0
@@ -1333,8 +1331,6 @@ async def maint_check(ctx: ContextTypes.DEFAULT_TYPE):
         return  # HA недоступний або сутності немає — нічого не міняємо
     on = state == "on"
     maint["on"] = on
-    if on:
-        maint["text"] = await maint_text(MAINT_TEXT, MAINT_DEFAULT)
     prev = stats.data.get("maint_on")
     if prev is None or prev == on:
         if prev is None:  # перший запуск з цією функцією — лише запам'ятати стан
@@ -1345,8 +1341,7 @@ async def maint_check(ctx: ContextTypes.DEFAULT_TYPE):
     stats.data["maint_on"] = on
     stats.dirty = True
     stats.save()
-    text = maint["text"] if on else await maint_text(MAINT_END_TEXT, MAINT_END_DEFAULT)
-    n = await broadcast(ctx.bot, text)
+    n = await broadcast(ctx.bot, MAINT_TEXT if on else MAINT_END_TEXT)
     log.info("технічні роботи %s — розіслано %d повідомлень", "увімкнено" if on else "вимкнено", n)
 
 

@@ -7,8 +7,9 @@
 ## dtek_power_bot — Telegram-бот графіків відключень ДТЕК
 
 - **Дані графіків — лише з сайтів ДТЕК** (вимога користувача). З Home Assistant бот (1.12.0, на прохання користувача)
-  читає тільки перемикач «Технічні роботи» і два тексти (`ha.py`, `homeassistant_api: true`, опції `maintenance_*`,
-  за замовчуванням `input_boolean.dtek_bot_tech_works`, `input_text.dtek_bot_tech_text`, `input_text.dtek_bot_tech_end_text`).
+  читає тільки перемикач «Технічні роботи» (`ha.py`, `homeassistant_api: true`, опція `maintenance_switch`,
+  за замовчуванням `input_boolean.dtek_bot_tech_works`; користувач перемикає його автоматизаціями). Тексти — звичайні
+  опції аддона `maintenance_text` / `maintenance_end_text` (як `deny_message`; так захотів користувач, не сутності HA).
   Job `maint_check` кожні 20 с: зміна стану → `broadcast()` тексту всім активним підпискам; поки увімкнено — у `allowed()`
   усім, крім адмінів, бот відповідає лише текстом робіт. Сповіщення про графік працюють далі. Стан — `stats.data['maint_on']`.
   Інших сутностей HA не читати й нічого в HA не змінювати без прохання.
@@ -24,9 +25,11 @@
   - `method=checkDisconUpdate&update=01.01.2000 00:00` → `{fact, preset}` для всіх черг;
   - `method=getHomeNum` + `data[i][name|value]` для `city`, `street`, `updateFact` → будинки
     `{номер: {sub_type_reason: ["GPV5.1"], sub_type, start_date, end_date}}`.
-  Сторінка ДТЕК має нескінченні CSS-анімації: без `NO_ANIMATIONS_CSS` headless Chromium малює їх постійно
-  (~14 % ядра на ПК, ~74 % CPU на K55D). Стиль додається в `DtekSite._load()` — не прибирати.
-  Версія без цього (1.10.0) збережена в гілці `backup/1.10.0-animations` і тегом `v1.10.0`.
+  З 1.13.0 сторінка потрібна лише, щоб пройти антибот і взяти cookie та CSRF (`_load`): після першої вдалої відповіді
+  вона йде на `about:blank`, а запити робить `ctx.request.post` (HTTP-клієнт браузера з cookie контексту) — `_request()`.
+  Відкрита сторінка ДТЕК їла ~50 % ядра навіть з `NO_ANIMATIONS_CSS` і з «замороженим» Page (перевірено 14.11.2026 на ПК),
+  з about:blank — ~0 %. Помилка запиту → `loaded_at = 0` → сторінка перезавантажується. Кожні 30 хв (`PAGE_MAX_AGE`) теж.
+  Версія без цього (1.10.0) — гілка `backup/1.10.0-animations`, тег `v1.10.0`.
 - `app/schedule.py` — розбір `fact`: `data[<unix ts півночі за Києвом>][GPVx.y][1..24]` зі станами
   `yes/no/first/second/maybe/mfirst/msecond`; `fact.update` — коли ДТЕК змінив графік.
   `updateTimestamp`, який сайт показує біля адреси, оновлюється постійно — для визначення змін не використовувати.

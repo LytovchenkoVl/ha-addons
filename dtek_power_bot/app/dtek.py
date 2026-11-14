@@ -33,26 +33,6 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 NO_ANIMATIONS_CSS = "*, *::before, *::after { animation: none !important; transition: none !important; }"
 
-# Той самий запит, що робить jQuery на сторінці ($.post('/ua/ajax', ...))
-AJAX_JS = """
-async (params) => {
-  const meta = document.querySelector('meta[name="csrf-token"]');
-  const body = new URLSearchParams();
-  for (const [k, v] of params) body.append(k, v);
-  const r = await fetch('/ua/ajax', {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: {
-      'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-      'X-Requested-With': 'XMLHttpRequest',
-      'X-CSRF-Token': meta ? meta.content : ''
-    },
-    body
-  });
-  return { status: r.status, text: await r.text() };
-}
-"""
-
 
 class DtekError(Exception):
     pass
@@ -69,6 +49,8 @@ class DtekSite:
         self.streets: dict[str, list[str]] = {}
         self.has_cities = True
         self.names: dict[str, str] = {}
+        self.csrf = ""
+        self.blank = False
 
     async def _load(self):
         if self.page:
@@ -99,6 +81,9 @@ class DtekSite:
             self.has_cities = True
             self.streets = streets
         self.names = info.get("names") or {}
+        self.csrf = await self.page.evaluate(
+            "() => (document.querySelector('meta[name=\"csrf-token\"]') || {}).content || ''")
+        self.blank = False
         self.loaded_at = time.monotonic()
         log.info("[%s] сторінка готова: %d населених пунктів", self.key, len(self.streets))
 
@@ -111,19 +96,35 @@ class DtekSite:
             for attempt in (1, 2):
                 try:
                     await self._ensure()
-                    res = await self.page.evaluate(AJAX_JS, params)
-                    if res["status"] == 200:
-                        data = json.loads(res["text"])
-                        if data.get("result"):
-                            return data
-                        raise DtekError("result=false")
-                    raise DtekError(f"HTTP {res['status']}")
+                    data = await self._request(params)
+                    if not self.blank:
+                        # cookie антибота й CSRF уже є — відкрита сторінка ДТЕК лише марно вантажить процесор
+                        # (~50 % ядра навіть без анімацій), тож запити далі йдуть без неї, а сторінка — about:blank
+                        await self.page.goto("about:blank")
+                        self.blank = True
+                    return data
                 except Exception as e:  # noqa: BLE001
                     log.warning("[%s] запит не вдався (спроба %d): %s", self.key, attempt, e)
                     self.loaded_at = 0  # наступна спроба перезавантажить сторінку
                     if attempt == 2:
                         raise DtekError(str(e)) from e
                     await asyncio.sleep(3)
+
+    async def _request(self, params: list[tuple[str, str]]) -> dict:
+        """Той самий POST /ua/ajax, що робить сторінка, але через HTTP-клієнт браузера (cookie контексту)."""
+        r = await self.ctx.request.post(
+            self.base + "/ua/ajax", form=dict(params), timeout=30_000,
+            headers={"X-Requested-With": "XMLHttpRequest", "X-CSRF-Token": self.csrf,
+                     "Referer": self.base + "/ua/shutdowns", "Origin": self.base})
+        if r.status != 200:
+            raise DtekError(f"HTTP {r.status}")
+        try:
+            data = json.loads(await r.text())
+        except ValueError as e:  # антибот віддав HTML замість JSON
+            raise DtekError("не JSON") from e
+        if not data.get("result"):
+            raise DtekError("result=false")
+        return data
 
     async def get_fact(self) -> dict:
         """Актуальний графік (fact) для всіх черг. Стара дата змушує сайт віддати повні дані."""
