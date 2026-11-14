@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import asyncio
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -17,6 +18,7 @@ from telegram.error import Forbidden
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler, ContextTypes,
                           MessageHandler, filters)
 
+import ha
 from dtek import REGIONS, Dtek, DtekError
 from schedule import (KYIV, fmt_when, format_schedule, group_label, has_changed, next_off_after, off_intervals,
                       signature, today_kyiv)
@@ -47,6 +49,13 @@ ADMIN_IDS, ADMIN_NAMES = parse_people(opts.get("admin_users") or os.environ.get(
 ALLOW_ALL = bool(opts["allow_all"]) if "allow_all" in opts else not (ALLOWED_IDS or ALLOWED_NAMES)
 DENY_MESSAGE = (opts.get("deny_message") or "").strip() or "Це приватний бот, доступ мають лише окремі люди."
 STARTED_AT = time.time()
+# «Технічні роботи»: перемикач і тексти — сутності Home Assistant (створює користувач, бот лише читає)
+MAINT_SWITCH = (opts.get("maintenance_switch") or "").strip()
+MAINT_TEXT = (opts.get("maintenance_text") or "").strip()
+MAINT_END_TEXT = (opts.get("maintenance_end_text") or "").strip()
+MAINT_DEFAULT = "🛠 Технічні роботи. Бот тимчасово може працювати з перебоями."
+MAINT_END_DEFAULT = "✅ Технічні роботи завершено, бот працює як звичайно."
+maint = {"on": False, "text": MAINT_DEFAULT}
 
 dtek = Dtek()
 
@@ -478,6 +487,13 @@ async def allowed(update: Update) -> bool:
     user = update.effective_user
     if user and is_allowed(user.id, user.username):
         stats.touch(user)
+        # технічні роботи: усім, крім адміністраторів, бот відповідає лише текстом про роботи
+        if maint["on"] and not is_admin(user.id, user.username):
+            if update.callback_query:
+                await update.callback_query.answer("Технічні роботи")
+            if update.effective_chat:
+                await update.effective_chat.send_message(maint["text"])
+            return False
         await ensure_keyboard(update.effective_chat, user)
         # людина знову пише боту (наприклад, після зміни токена) — відновлюємо сповіщення
         sub = store.get(update.effective_chat.id) if update.effective_chat else None
@@ -1287,6 +1303,53 @@ async def _send(ctx, chat_id, sub: dict, text: str, kind: str) -> bool:
     return False
 
 
+async def maint_text(entity: str, default: str) -> str:
+    text = (await ha.get_state(entity) or "").strip() if entity else ""
+    return default if text in ("", "unknown", "unavailable") else text
+
+
+async def broadcast(bot, text: str):
+    """Одне повідомлення всім активним підпискам (без кнопок)."""
+    sent = 0
+    for chat_id, sub in list(store.data.items()):
+        if sub.get("paused") or not is_allowed(sub.get("user_id"), sub.get("username")):
+            continue
+        try:
+            await bot.send_message(int(chat_id), text)
+            sent += 1
+        except Forbidden:
+            sub["paused"] = True
+        except Exception as e:  # noqa: BLE001
+            log.warning("не вдалося надіслати в %s: %s", chat_id, e)
+        await asyncio.sleep(0.05)  # ліміт Telegram ~30 повідомлень/с
+    store.save()
+    return sent
+
+
+async def maint_check(ctx: ContextTypes.DEFAULT_TYPE):
+    """Стежить за перемикачем «Технічні роботи» в HA; на вмикання/вимикання розсилає тексти."""
+    state = await ha.get_state(MAINT_SWITCH)
+    if state not in ("on", "off"):
+        return  # HA недоступний або сутності немає — нічого не міняємо
+    on = state == "on"
+    maint["on"] = on
+    if on:
+        maint["text"] = await maint_text(MAINT_TEXT, MAINT_DEFAULT)
+    prev = stats.data.get("maint_on")
+    if prev is None or prev == on:
+        if prev is None:  # перший запуск з цією функцією — лише запам'ятати стан
+            stats.data["maint_on"] = on
+            stats.dirty = True
+            stats.save()
+        return
+    stats.data["maint_on"] = on
+    stats.dirty = True
+    stats.save()
+    text = maint["text"] if on else await maint_text(MAINT_END_TEXT, MAINT_END_DEFAULT)
+    n = await broadcast(ctx.bot, text)
+    log.info("технічні роботи %s — розіслано %d повідомлень", "увімкнено" if on else "вимкнено", n)
+
+
 def _place(sub: dict, groups: list[str]) -> str:
     names = dtek.site(sub["region"]).names
     g = html.escape(", ".join(group_label(x, names) for x in groups))
@@ -1425,6 +1488,8 @@ async def post_init(app: Application):
     # опис бота (порожній чат і профіль) задається вручну в @BotFather: /setdescription, /setabouttext
     app.job_queue.run_repeating(poll, interval=POLL_MINUTES * 60, first=15)
     app.job_queue.run_repeating(remind, interval=60, first=40)
+    if MAINT_SWITCH:
+        app.job_queue.run_repeating(maint_check, interval=20, first=5)
     stats.started(store.data)
     log.info("Бот запущено. Перевірка кожні %d хв, підписок: %d, людей у статистиці: %d (файл %s)",
              POLL_MINUTES, len(store.data), len(stats.data["users"]), stats.path)

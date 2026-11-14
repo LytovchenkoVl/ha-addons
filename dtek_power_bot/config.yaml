@@ -1,5 +1,5 @@
 name: "ДТЕК графіки — Telegram бот"
-version: "1.11.2"
+version: "1.12.0"
 slug: dtek_power_bot
 description: "Надсилає в Telegram графік відключень ДТЕК за адресою або чергою, щойно він змінюється"
 url: "https://www.dtek-krem.com.ua/ua/shutdowns"
@@ -7,6 +7,9 @@ arch:
   - amd64
 startup: application
 boot: auto
+homeassistant_api: true
+map:
+  - addon_config:rw
 options:
   telegram_token: ""
   poll_minutes: 2
@@ -14,6 +17,9 @@ options:
   allowed_users: []
   deny_message: "Це приватний бот, доступ мають лише окремі люди."
   admin_users: []
+  maintenance_switch: "input_boolean.dtek_bot_tech_works"
+  maintenance_text: "input_text.dtek_bot_tech_text"
+  maintenance_end_text: "input_text.dtek_bot_tech_end_text"
 schema:
   telegram_token: password
   poll_minutes: "int(1,30)"
@@ -23,3 +29,6 @@ schema:
   deny_message: "str?"
   admin_users:
     - str
+  maintenance_switch: "str?"
+  maintenance_text: "str?"
+  maintenance_end_text: "str?"

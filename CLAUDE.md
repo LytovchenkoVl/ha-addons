@@ -6,8 +6,16 @@
 
 ## dtek_power_bot — Telegram-бот графіків відключень ДТЕК
 
-- **Дані лише з сайтів ДТЕК** (вимога користувача). Бот не має доступу до Home Assistant: у `config.yaml` немає
-  `homeassistant_api`/`hassio_api`, код не читає сутностей, датчиків чи перемикачів HA. Не додавати без прохання.
+- **Дані графіків — лише з сайтів ДТЕК** (вимога користувача). З Home Assistant бот (1.12.0, на прохання користувача)
+  читає тільки перемикач «Технічні роботи» і два тексти (`ha.py`, `homeassistant_api: true`, опції `maintenance_*`,
+  за замовчуванням `input_boolean.dtek_bot_tech_works`, `input_text.dtek_bot_tech_text`, `input_text.dtek_bot_tech_end_text`).
+  Job `maint_check` кожні 20 с: зміна стану → `broadcast()` тексту всім активним підпискам; поки увімкнено — у `allowed()`
+  усім, крім адмінів, бот відповідає лише текстом робіт. Сповіщення про графік працюють далі. Стан — `stats.data['maint_on']`.
+  Інших сутностей HA не читати й нічого в HA не змінювати без прохання.
+- **Швидке оновлення без збірки** (`start.sh`): код із `/config/app` (= `/app_configs/cbbecad4_dtek_power_bot/app` на HA)
+  запускається, якщо `/config/app/VERSION` новіший за версію образу. Порядок: підняти `version`, push на GitHub,
+  `scp app/*.py` + `VERSION` туди, `ha apps restart`. Оновлення з GitHub тієї ж версії повертає код з образу.
+  Зміни `requirements.txt`/Dockerfile так не доставити — лише збіркою.
 - `app/bot.py` — Telegram (python-telegram-bot 21–22, job-queue): `/start` (регіон → адреса або черга), `/now`, `/stop`,
   опитування сайту кожні `poll_minutes`, підписки в `/data/subscriptions.json` (по одній на чат).
 - `app/dtek.py` — Playwright Chromium відкриває `https://www.dtek-<krem|kem|dnem|oem>.com.ua/ua/shutdowns`
