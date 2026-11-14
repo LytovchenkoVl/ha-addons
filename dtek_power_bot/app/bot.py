@@ -26,6 +26,7 @@ from schedule import (KYIV, fmt_when, format_schedule, group_label, has_changed,
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("apscheduler").setLevel(logging.WARNING)  # перемикач робіт перевіряється кожні 3 с — без шуму в журналі
 log = logging.getLogger("bot")
 
 # ---------- налаштування ----------
@@ -1338,25 +1339,47 @@ async def _send(ctx, chat_id, sub: dict, text: str, kind: str) -> bool:
     return False
 
 
-async def broadcast(bot, text: str):
-    """Одне повідомлення всім активним підпискам і адміністраторам, навіть без підписки (без кнопок)."""
+async def fan_out(chats: dict, send) -> int:
+    """Розсилка: адміністратори першими, далі пачками по 25 паралельно (ліміт Telegram ~30 повідомлень/с).
+    chats — {chat_id: підписка або None}; send(chat_id, sub) надсилає одне повідомлення."""
+    admins = admin_chat_ids()
+    order = sorted(chats, key=lambda c: c not in admins)
     sent = 0
-    chats = {int(c): s for c, s in store.data.items()
-             if not s.get("paused") and is_allowed(s.get("user_id"), s.get("username"))}
-    for cid in admin_chat_ids():
-        chats.setdefault(cid, None)
-    for chat_id, sub in chats.items():
+
+    async def one(cid):
+        nonlocal sent
+        sub = chats[cid]
         try:
-            await bot.send_message(chat_id, text)
+            await send(cid, sub)
             sent += 1
         except Forbidden:
             if sub is not None:
                 sub["paused"] = True
         except Exception as e:  # noqa: BLE001
-            log.warning("не вдалося надіслати в %s: %s", chat_id, e)
-        await asyncio.sleep(0.05)  # ліміт Telegram ~30 повідомлень/с
+            log.warning("не вдалося надіслати в %s: %s", cid, e)
+
+    for i in range(0, len(order), 25):
+        if i:
+            await asyncio.sleep(1)
+        await asyncio.gather(*(one(c) for c in order[i:i + 25]))
     store.save()
     return sent
+
+
+def broadcast_chats() -> dict:
+    """Активні підписки і адміністратори, навіть без підписки."""
+    chats = {int(c): s for c, s in store.data.items()
+             if not s.get("paused") and is_allowed(s.get("user_id"), s.get("username"))}
+    for cid in admin_chat_ids():
+        chats.setdefault(cid, None)
+    return chats
+
+
+async def broadcast(bot, text: str) -> int:
+    """Одне повідомлення всім (без кнопок)."""
+    async def send(cid, sub):
+        await bot.send_message(cid, text)
+    return await fan_out(broadcast_chats(), send)
 
 
 async def broadcast_end(bot) -> int:
@@ -1368,33 +1391,16 @@ async def broadcast_end(bot) -> int:
         except DtekError as e:
             log.warning("[%s] кінець робіт: графік не взяти: %s", region, e)
     header = f"<b>{html.escape(MAINT_END_TEXT)}</b>"
-    sent, done = 0, set()
-    for chat_id, sub in list(store.data.items()):
-        if sub.get("paused") or not is_allowed(sub.get("user_id"), sub.get("username")):
-            continue
-        fact = facts.get(sub["region"])
-        try:
-            if fact is None:
-                await bot.send_message(int(chat_id), MAINT_END_TEXT)
-            else:
-                await send_schedule(bot, int(chat_id), sub, header=header, fact=fact)
-                # графік щойно надіслано — щоб наступна перевірка не прислала його ще раз як «змінився»
-                sub["sig"], sub["update"] = signature(fact, sub["groups"]), fact.get("update")
-            sent += 1
-        except Forbidden:
-            sub["paused"] = True
-        except Exception as e:  # noqa: BLE001
-            log.warning("не вдалося надіслати в %s: %s", chat_id, e)
-        done.add(int(chat_id))
-        await asyncio.sleep(0.05)
-    for cid in admin_chat_ids() - done:
-        try:
+
+    async def send(cid, sub):
+        fact = facts.get(sub["region"]) if sub else None
+        if fact is None:
             await bot.send_message(cid, MAINT_END_TEXT)
-            sent += 1
-        except Exception as e:  # noqa: BLE001
-            log.warning("не вдалося надіслати в %s: %s", cid, e)
-    store.save()
-    return sent
+            return
+        await send_schedule(bot, cid, sub, header=header, fact=fact)
+        # графік щойно надіслано — щоб наступна перевірка не прислала його ще раз як «змінився»
+        sub["sig"], sub["update"] = signature(fact, sub["groups"]), fact.get("update")
+    return await fan_out(broadcast_chats(), send)
 
 
 async def set_maint(bot, on: bool, why: str):
@@ -1425,7 +1431,7 @@ async def live_options() -> dict | None:
 
 
 async def apply_maint_option(ctx: ContextTypes.DEFAULT_TYPE):
-    """Кожні 20 с: тексти й перемикач з налаштувань аддона. Перемикач діє, лише коли його змінили
+    """Кожні 3 с: тексти й перемикач з налаштувань аддона. Перемикач діє, лише коли його змінили
     (інакше лишається стан, заданий через stdin)."""
     global MAINT_TEXT, MAINT_END_TEXT
     live = await live_options()
@@ -1596,7 +1602,7 @@ async def post_init(app: Application):
     # опис бота (порожній чат і профіль) задається вручну в @BotFather: /setdescription, /setabouttext
     app.job_queue.run_repeating(poll, interval=POLL_MINUTES * 60, first=15)
     app.job_queue.run_repeating(remind, interval=60, first=40)
-    app.job_queue.run_repeating(apply_maint_option, interval=20, first=5)
+    app.job_queue.run_repeating(apply_maint_option, interval=3, first=5)
     asyncio.get_running_loop().create_task(read_stdin(app.bot))
     stats.started(store.data)
     log.info("Бот запущено. Перевірка кожні %d хв, підписок: %d, людей у статистиці: %d (файл %s)",
