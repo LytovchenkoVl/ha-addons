@@ -10,3 +10,8 @@ Telegram-бот, який бере графік відключень прямо 
 3. Знайдіть «ДТЕК графіки — Telegram бот», встановіть, вкажіть токен від @BotFather у вкладці «Конфігурація», запустіть.
 
 Докладніше — у [dtek_power_bot/DOCS.md](dtek_power_bot/DOCS.md).
+
+## Lampac
+
+[Lampac NextGen](https://github.com/lampac-nextgen/lampac) для Лампи на основі офіційного образу; порт 9118.
+Докладніше — у [lampac/DOCS.md](lampac/DOCS.md).

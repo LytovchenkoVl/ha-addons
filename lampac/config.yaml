@@ -1,0 +1,17 @@
+name: "Lampac"
+version: "1.90.0"
+slug: lampac
+description: "Lampac NextGen — сервер для Лампи: онлайн-джерела, синхронізація, плагіни"
+url: "https://github.com/lampac-nextgen/lampac"
+arch:
+  - amd64
+startup: application
+boot: auto
+init: false
+webui: "http://[HOST]:[PORT:9118]/"
+ports:
+  9118/tcp: 9118
+ports_description:
+  9118/tcp: "Lampac (адреса для Лампи)"
+map:
+  - addon_config:rw

@@ -79,3 +79,9 @@
   Коли графіків немає (ДнЕМ, ОЕМ на 23.10), `fact.data` — порожній масив.
 - 23.10.2026 перевірено вживу на сервері користувача: антибот ДТЕК пропускає headless Chromium з домашнього IP,
   сповіщення про зміну графіка приходять.
+
+## lampac — Lampac NextGen
+
+- `Dockerfile` — `FROM ghcr.io/lampac-nextgen/lampac:<версія>`; `version` у `config.yaml` = тег образу (оновлювати разом).
+- `run.sh` (від root) переносить `init.conf`, `passwd`, `cache/`, `database/` у `/config` (addon_config) симлінками
+  і запускає `dotnet Core.dll` як uid 1000 (`setpriv`). Порт 9118.
