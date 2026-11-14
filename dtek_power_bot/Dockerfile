@@ -6,7 +6,10 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 COPY requirements.txt /app/
-RUN pip install -r requirements.txt \
+# libatomic1: новіші Playwright запускають свій Node, якому потрібна ця бібліотека, а в slim-образі її немає
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libatomic1 \
+    && pip install -r requirements.txt \
     && playwright install --with-deps chromium \
     && rm -rf /var/lib/apt/lists/*
 
