@@ -45,6 +45,10 @@ def parse_people(raw) -> tuple[set[int], set[str]]:
 
 ALLOWED_IDS, ALLOWED_NAMES = parse_people(opts.get("allowed_users") or os.environ.get("ALLOWED_USERS", "").split(","))
 ADMIN_IDS, ADMIN_NAMES = parse_people(opts.get("admin_users") or os.environ.get("ADMIN_USERS", "").split(","))
+# власник — одна людина: ті самі права, що й в адміністраторів, і контакт у довідці
+OWNER_IDS, OWNER_NAMES = parse_people([opts.get("owner") or os.environ.get("BOT_OWNER", "")])
+ADMIN_IDS |= OWNER_IDS
+ADMIN_NAMES |= OWNER_NAMES
 # «Доступ для всіх»; якщо параметра немає — для всіх лише тоді, коли список порожній
 ALLOW_ALL = bool(opts["allow_all"]) if "allow_all" in opts else not (ALLOWED_IDS or ALLOWED_NAMES)
 DENY_MESSAGE = (opts.get("deny_message") or "").strip() or "Це приватний бот, доступ мають лише окремі люди."
@@ -382,10 +386,31 @@ HELP_TEXT = (
     "• Якщо будинок у двох чергах — показую обидві.\n"
     "• Що саме надсилати — у «⚙️ Налаштування».\n\n"
     f"{COMMANDS_TEXT}\n\n"
-    "Під кожним графіком є кнопка «🔄 Оновити».\n\n"
-    "<i>Вказана адреса зберігається на сервері власника бота і видна йому. "
-    "Щоб її видалити — /stop.</i>"
+    "Під кожним графіком є кнопка «🔄 Оновити»."
 )
+
+
+def is_owner(user_id: int | None, username: str | None) -> bool:
+    return (user_id in OWNER_IDS) or bool(username and username.lower() in OWNER_NAMES)
+
+
+def owner_contact() -> str | None:
+    """@username власника (з налаштувань або з того, що він писав боту), інакше посилання на його профіль."""
+    if OWNER_NAMES:
+        return f"@{next(iter(OWNER_NAMES))}"
+    for oid in OWNER_IDS:
+        u = stats.data["users"].get(str(oid)) or {}
+        if u.get("username"):
+            return f"@{html.escape(u['username'])}"
+        return f'<a href="tg://user?id={oid}">власнику бота</a>'
+    return None
+
+
+def help_text() -> str:
+    contact = owner_contact()
+    if not contact:
+        return HELP_TEXT
+    return HELP_TEXT + f"\n\n<i>З питаннями, побажаннями чи доповненнями пишіть {contact}.</i>"
 
 
 # ---------- налаштування сповіщень ----------
@@ -693,7 +718,7 @@ async def cmd_stop(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not await allowed(update):
         return
-    await update.effective_chat.send_message(HELP_TEXT, parse_mode=ParseMode.HTML, reply_markup=kb([[BACK_BTN]]))
+    await update.effective_chat.send_message(help_text(), parse_mode=ParseMode.HTML, reply_markup=kb([[BACK_BTN]]))
 
 
 def _fmt_ago(ts: float) -> str:
@@ -772,9 +797,11 @@ def stats_text() -> str:
         if u.get("username"):
             who += f" @{html.escape(u['username'])}"
         seen = f"останній вхід {u['last'][8:10]}.{u['last'][5:7]}" if u.get("last") else "ще не писав боту"
-        lines.append(f"{who} — <code>{cid}</code>, {seen}")
+        role = "власник, " if is_owner(cid, u.get("username")) else ""
+        lines.append(f"{who} — <code>{cid}</code>, {role}{seen}")
     for name in sorted(ADMIN_NAMES - known):
-        lines.append(f"@{html.escape(name)} — ще не писав боту")
+        role = "власник, " if name in OWNER_NAMES else ""
+        lines.append(f"@{html.escape(name)} — {role}ще не писав боту")
     if not ADMIN_IDS and not ADMIN_NAMES:
         lines.append("<i>не вказано</i>")
 
