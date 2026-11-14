@@ -1307,16 +1307,19 @@ async def _send(ctx, chat_id, sub: dict, text: str, kind: str) -> bool:
 
 
 async def broadcast(bot, text: str):
-    """Одне повідомлення всім активним підпискам (без кнопок)."""
+    """Одне повідомлення всім активним підпискам і адміністраторам, навіть без підписки (без кнопок)."""
     sent = 0
-    for chat_id, sub in list(store.data.items()):
-        if sub.get("paused") or not is_allowed(sub.get("user_id"), sub.get("username")):
-            continue
+    chats = {int(c): s for c, s in store.data.items()
+             if not s.get("paused") and is_allowed(s.get("user_id"), s.get("username"))}
+    for cid in admin_chat_ids():
+        chats.setdefault(cid, None)
+    for chat_id, sub in chats.items():
         try:
-            await bot.send_message(int(chat_id), text)
+            await bot.send_message(chat_id, text)
             sent += 1
         except Forbidden:
-            sub["paused"] = True
+            if sub is not None:
+                sub["paused"] = True
         except Exception as e:  # noqa: BLE001
             log.warning("не вдалося надіслати в %s: %s", chat_id, e)
         await asyncio.sleep(0.05)  # ліміт Telegram ~30 повідомлень/с
